@@ -66,3 +66,42 @@ def test_unknown_tool_is_rejected():
     response = client.post("/workflows/execute", json=payload)
 
     assert response.status_code == 422
+    
+def test_workflow_run_is_saved():
+    payload = {
+        "name": "Persistent Workflow",
+        "steps": [
+            {"tool": "calculator", "input": "8 * 8"}
+        ],
+    }
+
+    execution = client.post("/workflows/execute", json=payload)
+
+    assert execution.status_code == 200
+    run_id = execution.json()["run_id"]
+
+    history = client.get(f"/workflows/runs/{run_id}")
+
+    assert history.status_code == 200
+    assert history.json()["workflow"] == "Persistent Workflow"
+    assert history.json()["results"][0]["result"] == 64
+
+
+def test_failed_workflow_is_saved():
+    payload = {
+        "name": "Failed Workflow",
+        "steps": [
+            {"tool": "calculator", "input": "1 / 0"}
+        ],
+    }
+
+    execution = client.post("/workflows/execute", json=payload)
+
+    assert execution.status_code == 400
+    run_id = execution.json()["detail"]["run_id"]
+
+    history = client.get(f"/workflows/runs/{run_id}")
+
+    assert history.status_code == 200
+    assert history.json()["status"] == "failed"
+    assert "Step 1 failed" in history.json()["error"]

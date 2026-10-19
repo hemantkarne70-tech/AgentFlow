@@ -7,6 +7,12 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from fastapi import Depends
+from sqlalchemy.orm import Session
+
+from app.db import Base, SessionLocal, engine
+from app.models import WorkflowRun
+
 
 app = FastAPI(
     title="AgentFlow API",
@@ -14,6 +20,15 @@ app = FastAPI(
     version="0.1.0",
 )
 
+Base.metadata.create_all(bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # Only these arithmetic operations are permitted.
 BINARY_OPERATORS = {
@@ -123,17 +138,23 @@ def health():
 
 
 @app.post("/workflows/execute")
-def execute_workflow(workflow: WorkflowRequest):
+def execute_workflow(
+    workflow: WorkflowRequest,
+    db: Session = Depends(get_db),
+):
     results = []
+    error_message = None
 
     for index, step in enumerate(workflow.steps, start=1):
         try:
             result = execute_tool(step.tool, step.input)
-        except (ValueError, SyntaxError, ArithmeticError) as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Step {index} failed: {exc}",
-            ) from exc
+        except (
+            ValueError,
+            SyntaxError,
+            ArithmeticError,
+        ) as exc:
+            error_message = f"Step {index} failed: {exc}"
+            break
 
         results.append(
             {
@@ -143,9 +164,99 @@ def execute_workflow(workflow: WorkflowRequest):
             }
         )
 
+    status = "failed" if error_message else "completed"
+
+    run = WorkflowRun(
+        name=workflow.name,
+        status=status,
+        total_steps=len(results),
+        results=results,
+        error=error_message,
+    )
+
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    if error_message:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "run_id": run.id,
+                "message": error_message,
+            },
+        )
+
     return {
-        "workflow": workflow.name,
-        "status": "completed",
-        "total_steps": len(results),
-        "results": results,
+        "run_id": run.id,
+        "workflow": run.name,
+        "status": run.status,
+        "total_steps": run.total_steps,
+        "results": run.results,
+        "created_at": run.created_at,
+    }
+    
+@app.get("/workflows/runs")
+def list_workflow_runs(
+    limit: int = 20,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    if not 1 <= limit <= 100:
+        raise HTTPException(
+            status_code=422,
+            detail="Limit must be between 1 and 100.",
+        )
+
+    if offset < 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Offset cannot be negative.",
+        )
+
+    runs = (
+        db.query(WorkflowRun)
+        .order_by(WorkflowRun.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "count": len(runs),
+        "runs": [
+            {
+                "run_id": run.id,
+                "workflow": run.name,
+                "status": run.status,
+                "total_steps": run.total_steps,
+                "error": run.error,
+                "created_at": run.created_at,
+            }
+            for run in runs
+        ],
+    }
+
+
+@app.get("/workflows/runs/{run_id}")
+def get_workflow_run(
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    run = db.get(WorkflowRun, run_id)
+
+    if run is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Workflow run not found.",
+        )
+
+    return {
+        "run_id": run.id,
+        "workflow": run.name,
+        "status": run.status,
+        "total_steps": run.total_steps,
+        "results": run.results,
+        "error": run.error,
+        "created_at": run.created_at,
     }
