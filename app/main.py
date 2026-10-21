@@ -5,15 +5,20 @@ from typing import Any, Literal
 from datetime import datetime, timezone
 import logging
 
+import redis
+
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from fastapi import Depends
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.db import Base, SessionLocal, engine
 from app.models import WorkflowRun
 from app.tasks import execute_workflow_task
+
+from app.config import APP_NAME, APP_VERSION, REDIS_URL
 
 logger = logging.getLogger(__name__)
 
@@ -152,15 +157,66 @@ def execute_tool(tool: str, value: str) -> Any:
 @app.get("/")
 def health_check():
     return {
-        "application": "AgentFlow",
+        "application": APP_NAME,
         "status": "running",
-        "version": "0.1.0",
+        "version": APP_VERSION,
     }
 
 
 @app.get("/health")
 def health():
+    # Backward-compatible liveness endpoint.
     return {"status": "healthy"}
+
+
+@app.get("/health/live")
+def health_live():
+    """Confirm that the API process is responding."""
+    return {
+        "status": "alive",
+        "application": APP_NAME,
+        "version": APP_VERSION,
+    }
+
+
+@app.get("/health/ready")
+def health_ready():
+    """Check whether the API's database and Redis are reachable."""
+    checks = {}
+
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception:
+        logger.exception("Database readiness check failed")
+        checks["database"] = "unavailable"
+
+    try:
+        client = redis.Redis.from_url(
+            REDIS_URL,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        client.ping()
+        checks["redis"] = "ok"
+    except Exception:
+        logger.exception("Redis readiness check failed")
+        checks["redis"] = "unavailable"
+
+    if any(value != "ok" for value in checks.values()):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "checks": checks,
+            },
+        )
+
+    return {
+        "status": "ready",
+        "checks": checks,
+    }
 
 
 @app.post("/workflows/execute")
