@@ -3,6 +3,7 @@ import math
 import operator
 from typing import Any, Literal
 from datetime import datetime, timezone
+import logging
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
@@ -13,6 +14,8 @@ from sqlalchemy.orm import Session
 from app.db import Base, SessionLocal, engine
 from app.models import WorkflowRun
 from app.tasks import execute_workflow_task
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="AgentFlow API",
@@ -270,15 +273,44 @@ def execute_workflow_async(
         task = execute_workflow_task.delay(run.id, steps)
 
     except Exception as exc:
+        finished_at = datetime.now(timezone.utc)
+
+        started_at = getattr(run, "started_at", None)
+        if started_at is None:
+            started_at = getattr(run, "created_at", None)
+
+        if started_at is None:
+            started_at = finished_at
+
+        # Normalize SQLite's timezone-naive datetime before subtraction.
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+
+        run.started_at = started_at
         run.status = "failed"
-        run.error = f"Could not enqueue workflow: {exc}"
+        run.error = f"Could not enqueue workflow: {type(exc).__name__}: {exc}"
+        run.finished_at = finished_at
+        run.duration_seconds = round(
+            max(0.0, (finished_at - started_at).total_seconds()),
+            3,
+        )
         db.commit()
+        db.refresh(run)
+
+        logger.exception("Could not enqueue workflow run %s", run.id)
 
         raise HTTPException(
             status_code=503,
             detail={
                 "run_id": run.id,
-                "message": "Unable to queue workflow. Check Redis and Celery configuration.",
+                "message": (
+                    "Unable to queue workflow. "
+                    "Check Redis and Celery configuration."
+                ),
+                "status": run.status,
+                "started_at": run.started_at.isoformat(),
+                "finished_at": run.finished_at.isoformat(),
+                "duration_seconds": run.duration_seconds,
             },
         ) from exc
 
