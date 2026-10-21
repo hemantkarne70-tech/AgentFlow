@@ -1,10 +1,10 @@
-
 import ast
 import math
 import operator
 from typing import Any, Literal
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from fastapi import Depends
@@ -142,6 +142,7 @@ def execute_workflow(
     workflow: WorkflowRequest,
     db: Session = Depends(get_db),
 ):
+    started_at = datetime.now(timezone.utc)
     results = []
     error_message = None
 
@@ -164,6 +165,12 @@ def execute_workflow(
             }
         )
 
+    finished_at = datetime.now(timezone.utc)
+    duration_seconds = round(
+        max(0.0, (finished_at - started_at).total_seconds()),
+        3,
+    )
+
     status = "failed" if error_message else "completed"
 
     run = WorkflowRun(
@@ -172,6 +179,9 @@ def execute_workflow(
         total_steps=len(results),
         results=results,
         error=error_message,
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_seconds=duration_seconds,
     )
 
     db.add(run)
@@ -180,12 +190,23 @@ def execute_workflow(
 
     if error_message:
         raise HTTPException(
-            status_code=400,
-            detail={
-                "run_id": run.id,
-                "message": error_message,
-            },
-        )
+        status_code=400,
+        detail={
+            "run_id": run.id,
+            "message": error_message,
+            "started_at": (
+                run.started_at.isoformat()
+                if run.started_at
+                else None
+            ),
+            "finished_at": (
+                run.finished_at.isoformat()
+                if run.finished_at
+                else None
+            ),
+            "duration_seconds": run.duration_seconds,
+        },
+    )
 
     return {
         "run_id": run.id,
@@ -194,6 +215,9 @@ def execute_workflow(
         "total_steps": run.total_steps,
         "results": run.results,
         "created_at": run.created_at,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "duration_seconds": run.duration_seconds,
     }
     
 
@@ -246,43 +270,72 @@ def execute_workflow_async(
     
 @app.get("/workflows/runs")
 def list_workflow_runs(
-    limit: int = 20,
-    offset: int = 0,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=100),
+    status: str | None = None,
+    search: str | None = None,
     db: Session = Depends(get_db),
 ):
-    if not 1 <= limit <= 100:
-        raise HTTPException(
-            status_code=422,
-            detail="Limit must be between 1 and 100.",
+    allowed_statuses = {"queued", "running", "completed", "failed"}
+
+    if status is not None:
+        status = status.strip().lower()
+        if status not in allowed_statuses:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Invalid workflow status.",
+                    "allowed_statuses": sorted(allowed_statuses),
+                },
+            )
+
+    query = db.query(WorkflowRun)
+
+    if status:
+        query = query.filter(WorkflowRun.status == status)
+
+    if search and search.strip():
+        query = query.filter(
+            WorkflowRun.name.ilike(f"%{search.strip()}%")
         )
 
-    if offset < 0:
-        raise HTTPException(
-            status_code=422,
-            detail="Offset cannot be negative.",
-        )
+    total = query.count()
+    total_pages = (total + per_page - 1) // per_page
 
     runs = (
-        db.query(WorkflowRun)
-        .order_by(WorkflowRun.id.desc())
-        .offset(offset)
-        .limit(limit)
+        query.order_by(WorkflowRun.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
         .all()
     )
 
     return {
-        "count": len(runs),
-        "runs": [
+        "items": [
             {
-                "run_id": run.id,
-                "workflow": run.name,
+                "id": run.id,
+                "name": run.name,
                 "status": run.status,
                 "total_steps": run.total_steps,
                 "error": run.error,
                 "created_at": run.created_at,
+                "started_at": run.started_at,
+                "finished_at": run.finished_at,
+                "duration_seconds": run.duration_seconds,
             }
             for run in runs
         ],
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total_items": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_previous": page > 1 and total > 0,
+        },
+        "filters": {
+            "status": status,
+            "search": search.strip() if search and search.strip() else None,
+        },
     }
 
 
@@ -307,4 +360,7 @@ def get_workflow_run(
         "results": run.results,
         "error": run.error,
         "created_at": run.created_at,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "duration_seconds": run.duration_seconds,
     }

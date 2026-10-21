@@ -1,7 +1,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, Integer, JSON, String, Text
+from sqlalchemy import Column, DateTime, Float, Integer, JSON, String, Text
 
 from app.db import Base
 
@@ -24,3 +24,6 @@ class WorkflowRun(Base):
         nullable=False,
         default=utc_now,
     )
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    duration_seconds = Column(Float, nullable=True)
