@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.db import Base, SessionLocal, engine
 from app.models import WorkflowRun
-
+from app.tasks import execute_workflow_task
 
 app = FastAPI(
     title="AgentFlow API",
@@ -195,6 +195,54 @@ def execute_workflow(
         "results": run.results,
         "created_at": run.created_at,
     }
+    
+
+@app.post("/workflows/execute-async", status_code=202)
+def execute_workflow_async(
+    workflow: WorkflowRequest,
+    db: Session = Depends(get_db),
+):
+    run = WorkflowRun(
+        name=workflow.name,
+        status="queued",
+        total_steps=0,
+        results=[],
+        error=None,
+    )
+
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    steps = [
+        step.model_dump()
+        for step in workflow.steps
+    ]
+
+    try:
+        task = execute_workflow_task.delay(run.id, steps)
+
+    except Exception as exc:
+        run.status = "failed"
+        run.error = f"Could not enqueue workflow: {exc}"
+        db.commit()
+
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "run_id": run.id,
+                "message": "Unable to queue workflow. Check Redis and Celery configuration.",
+            },
+        ) from exc
+
+    return {
+        "run_id": run.id,
+        "task_id": task.id,
+        "workflow": run.name,
+        "status": run.status,
+        "status_url": f"/workflows/runs/{run.id}",
+    }
+
     
 @app.get("/workflows/runs")
 def list_workflow_runs(
