@@ -105,3 +105,30 @@ def test_failed_workflow_is_saved():
     assert history.status_code == 200
     assert history.json()["status"] == "failed"
     assert "Step 1 failed" in history.json()["error"]
+    
+def test_execute_workflow_rejects_blank_name():
+    response = client.post(
+        "/workflows/execute",
+        json={
+            "name": "   ",
+            "steps": [
+                {"tool": "uppercase", "input": "hello"}
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_execute_workflow_rejects_blank_step_input():
+    response = client.post(
+        "/workflows/execute",
+        json={
+            "name": "Validation Test",
+            "steps": [
+                {"tool": "uppercase", "input": "   "}
+            ],
+        },
+    )
+    
+    assert response.status_code == 422

@@ -5,7 +5,7 @@ from typing import Any, Literal
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from fastapi import Depends
 from sqlalchemy.orm import Session
@@ -98,12 +98,35 @@ def safe_calculate(expression: str) -> int | float:
 
 class WorkflowStep(BaseModel):
     tool: Literal["calculator", "uppercase", "word_count"]
-    input: str = Field(max_length=500)
+    input: str = Field(
+        min_length=1,
+        max_length=500,
+    )
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Step input cannot be blank.")
+        return value
 
 
 class WorkflowRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    steps: list[WorkflowStep] = Field(min_length=1, max_length=20)
+    name: str = Field(
+        min_length=1,
+        max_length=100,
+    )
+    steps: list[WorkflowStep] = Field(
+        min_length=1,
+        max_length=20,
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Workflow name cannot be blank.")
+        return value
 
 
 def execute_tool(tool: str, value: str) -> Any:
