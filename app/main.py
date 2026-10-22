@@ -4,10 +4,13 @@ import operator
 from typing import Any, Literal
 from datetime import datetime, timedelta, timezone
 import logging
+import hmac
+import os
 
 import redis
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from sqlalchemy.orm import Session
@@ -36,6 +39,32 @@ app = FastAPI(
     description="A lightweight workflow execution engine.",
     version="0.1.0",
 )
+
+# Optional API-key protection. Set AGENTFLOW_API_KEY in the environment to enable it.
+# Liveness/readiness endpoints remain public for container orchestration.
+_PUBLIC_PATHS = {"/", "/health", "/health/live", "/health/ready"}
+
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    configured_key = os.getenv("AGENTFLOW_API_KEY", "").strip()
+    if not configured_key:
+        # Local development remains frictionless. Configure a key before exposing
+        # this service outside a trusted development environment.
+        return await call_next(request)
+
+    if request.url.path in _PUBLIC_PATHS:
+        return await call_next(request)
+
+    supplied_key = request.headers.get("X-API-Key", "")
+    if not supplied_key or not hmac.compare_digest(supplied_key, configured_key):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Missing or invalid API key."},
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    return await call_next(request)
 
 Base.metadata.create_all(bind=engine)
 
