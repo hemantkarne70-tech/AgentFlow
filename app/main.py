@@ -1,4 +1,6 @@
 import ast
+import csv
+import io
 import math
 import operator
 from typing import Any, Literal
@@ -15,11 +17,11 @@ from collections import deque
 import redis
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from sqlalchemy.orm import Session
-from sqlalchemy import inspect, text
+from sqlalchemy import func, inspect, text
 
 from app.db import Base, SessionLocal, engine
 from app.models import WorkflowRun, WorkflowStepTrace, WorkflowTemplate
@@ -849,6 +851,88 @@ def list_workflow_runs(
             "search": search.strip() if search and search.strip() else None,
         },
     }
+
+
+@app.get("/workflows/analytics")
+def workflow_analytics(db: Session = Depends(get_db)):
+    """Return aggregate workflow execution metrics for dashboards."""
+    status_rows = (
+        db.query(WorkflowRun.status, func.count(WorkflowRun.id))
+        .group_by(WorkflowRun.status)
+        .all()
+    )
+    status_counts = {status: int(count) for status, count in status_rows}
+    total_runs = sum(status_counts.values())
+    completed = status_counts.get("completed", 0)
+    failed = status_counts.get("failed", 0)
+    cancelled = status_counts.get("cancelled", 0)
+    terminal_runs = completed + failed + cancelled
+
+    average_duration = db.query(func.avg(WorkflowRun.duration_seconds)).filter(
+        WorkflowRun.duration_seconds.isnot(None)
+    ).scalar()
+    total_steps = db.query(func.coalesce(func.sum(WorkflowRun.total_steps), 0)).scalar()
+    latest = db.query(WorkflowRun).order_by(WorkflowRun.id.desc()).first()
+
+    return {
+        "total_runs": total_runs,
+        "status_counts": status_counts,
+        "success_rate_percent": round((completed / terminal_runs) * 100, 2) if terminal_runs else 0.0,
+        "average_duration_seconds": round(float(average_duration), 3) if average_duration is not None else None,
+        "total_steps": int(total_steps or 0),
+        "latest_run": {
+            "id": latest.id,
+            "name": latest.name,
+            "status": latest.status,
+            "created_at": latest.created_at,
+        } if latest else None,
+    }
+
+
+@app.get("/workflows/runs/export")
+def export_workflow_runs(
+    status: str | None = None,
+    search: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """Export up to 10,000 workflow runs as CSV, optionally filtered."""
+    allowed_statuses = {"queued", "running", "completed", "failed", "cancelled"}
+    if status is not None:
+        status = status.strip().lower()
+        if status not in allowed_statuses:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "Invalid workflow status.", "allowed_statuses": sorted(allowed_statuses)},
+            )
+
+    query = db.query(WorkflowRun)
+    if status:
+        query = query.filter(WorkflowRun.status == status)
+    if search and search.strip():
+        query = query.filter(WorkflowRun.name.ilike(f"%{search.strip()}%"))
+
+    runs = query.order_by(WorkflowRun.id.desc()).limit(10_000).all()
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow([
+        "id", "workflow", "status", "total_steps", "created_at",
+        "started_at", "finished_at", "duration_seconds",
+    ])
+    for run in runs:
+        # Prevent spreadsheet formula execution from user-controlled workflow names.
+        safe_name = run.name
+        if safe_name and safe_name[0] in "=+-@\t\r":
+            safe_name = "'" + safe_name
+        writer.writerow([
+            run.id, safe_name, run.status, run.total_steps, run.created_at,
+            run.started_at, run.finished_at, run.duration_seconds,
+        ])
+
+    return Response(
+        content="\ufeff" + output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="agentflow-workflow-runs.csv"'},
+    )
 
 
 @app.post("/workflows/runs/{run_id}/cancel")
