@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text
 from app.db import Base
 
 
@@ -21,6 +21,7 @@ class WorkflowRun(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
     duration_seconds = Column(Float, nullable=True)
+    cancel_requested = Column(Boolean, nullable=False, default=False, index=True)
 
 
 class WorkflowStepTrace(Base):

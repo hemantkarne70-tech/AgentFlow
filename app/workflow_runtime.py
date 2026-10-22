@@ -10,6 +10,15 @@ class WorkflowInputError(ValueError):
     """Raised when a step references an invalid or unavailable result."""
 
 
+class WorkflowCancelledError(RuntimeError):
+    """Raised when cancellation is requested between workflow steps."""
+
+    def __init__(self, next_step_number: int, partial_results: list[dict]):
+        self.next_step_number = next_step_number
+        self.partial_results = partial_results
+        super().__init__(f"Workflow cancellation requested before step {next_step_number}.")
+
+
 class WorkflowStepExecutionError(RuntimeError):
     """Execution failure that retains successful results and trace context."""
 
@@ -91,11 +100,15 @@ def execute_workflow_steps(
     steps: list[dict],
     execute_tool: Callable[[str, str], Any],
     trace_callback: Callable[[dict], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[dict]:
     """Execute steps in order, preserving result shape and emitting a trace per step."""
     results: list[dict] = []
 
     for index, step in enumerate(steps, start=1):
+        if should_cancel is not None and should_cancel():
+            raise WorkflowCancelledError(index, results)
+
         tool = step.get("tool")
         started_at = datetime.now(timezone.utc)
         monotonic_start = time.perf_counter()

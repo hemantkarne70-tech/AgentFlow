@@ -13,13 +13,14 @@ from app.tools import execute_tool
 from app.workflow_runtime import (
     execute_workflow_steps,
     WorkflowStepExecutionError,
+    WorkflowCancelledError,
 )
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
 ACTIVE_STATUSES = {"queued", "running"}
-TERMINAL_STATUSES = {"completed", "failed"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 
 def utc_now():
@@ -148,6 +149,13 @@ def execute_workflow_task(self, run_id: int, steps: list[dict]):
             getattr(self.request, "id", None),
         )
 
+        def cancellation_requested() -> bool:
+            # Refresh the persisted flag so requests from the API are observed
+            # between steps, even though this worker has an open DB session.
+            db.expire_all()
+            current_run = db.get(WorkflowRun, run_id)
+            return current_run is None or bool(getattr(current_run, "cancel_requested", False))
+
         def persist_step_trace(trace: dict) -> None:
             db.add(WorkflowStepTrace(run_id=run_id, **trace))
             # Persist each step as it finishes so diagnostics survive later failures.
@@ -155,8 +163,24 @@ def execute_workflow_task(self, run_id: int, steps: list[dict]):
 
         try:
             results = execute_workflow_steps(
-                steps, execute_tool, trace_callback=persist_step_trace
+                steps, execute_tool, trace_callback=persist_step_trace,
+                should_cancel=cancellation_requested,
             )
+        except WorkflowCancelledError as exc:
+            run.results = exc.partial_results
+            run.total_steps = len(exc.partial_results)
+            finish_run(run, "cancelled", str(exc))
+            db.commit()
+            logger.info("Workflow %s cancelled before step %s", run_id, exc.next_step_number)
+            return {
+                "run_id": run.id,
+                "status": "cancelled",
+                "total_steps": run.total_steps,
+                "results": run.results,
+                "error": run.error,
+                "finished_at": run.finished_at.isoformat(),
+                "duration_seconds": run.duration_seconds,
+            }
         except WorkflowStepExecutionError as exc:
             run.results = exc.partial_results
             run.total_steps = len(exc.partial_results)

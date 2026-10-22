@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 from app.db import Base, SessionLocal, engine
 from app.models import WorkflowRun, WorkflowStepTrace, WorkflowTemplate
@@ -38,6 +38,26 @@ app = FastAPI(
 )
 
 Base.metadata.create_all(bind=engine)
+
+
+def ensure_cancellation_schema() -> None:
+    """Add the cancellation flag to existing databases without a migration tool."""
+    columns = {column["name"] for column in inspect(engine).get_columns("workflow_runs")}
+    if "cancel_requested" in columns:
+        return
+
+    # SQLite requires a constant default for adding a NOT NULL column to an
+    # existing table. PostgreSQL uses its native boolean literal.
+    default_value = "0" if engine.dialect.name == "sqlite" else "FALSE"
+    with engine.begin() as connection:
+        connection.execute(text(
+            "ALTER TABLE workflow_runs ADD COLUMN cancel_requested "
+            f"BOOLEAN NOT NULL DEFAULT {default_value}"
+        ))
+    logger.info("Added missing workflow_runs.cancel_requested column")
+
+
+ensure_cancellation_schema()
 
 
 def get_db():
@@ -548,6 +568,51 @@ def list_workflow_runs(
             "search": search.strip() if search and search.strip() else None,
         },
     }
+
+
+@app.post("/workflows/runs/{run_id}/cancel")
+def cancel_workflow_run(run_id: int, db: Session = Depends(get_db)):
+    """Cancel a queued run or request cooperative cancellation of a running run."""
+    run = db.get(WorkflowRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+
+    if run.status in {"completed", "failed", "cancelled"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Workflow is already in terminal state '{run.status}'.",
+        )
+
+    if run.status == "queued":
+        now = datetime.now(timezone.utc)
+        started_at = run.started_at or run.created_at or now
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        run.cancel_requested = True
+        run.status = "cancelled"
+        run.error = "Workflow cancelled before execution started."
+        run.started_at = started_at
+        run.finished_at = now
+        run.duration_seconds = round(max(0.0, (now - started_at).total_seconds()), 3)
+        db.commit()
+        db.refresh(run)
+        return {
+            "run_id": run.id,
+            "status": run.status,
+            "message": "Queued workflow cancelled; the worker will skip execution if the task is delivered.",
+        }
+
+    if run.status == "running":
+        run.cancel_requested = True
+        db.commit()
+        return {
+            "run_id": run.id,
+            "status": run.status,
+            "cancel_requested": True,
+            "message": "Cancellation requested. The current step may finish before cancellation takes effect.",
+        }
+
+    raise HTTPException(status_code=409, detail=f"Workflow status '{run.status}' cannot be cancelled.")
 
 
 @app.get("/workflows/runs/{run_id}/traces")
