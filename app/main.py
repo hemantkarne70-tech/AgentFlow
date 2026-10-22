@@ -45,12 +45,30 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Optional API-key protection and in-process sliding-window rate limiting.
-# Configure a key before exposing this service outside a trusted environment.
-# Liveness/readiness endpoints remain public for container orchestration.
+# Optional API-key protection and Redis-backed sliding-window rate limiting.
+# Redis shares counters across FastAPI workers/instances. If Redis is unavailable,
+# the middleware falls back to a per-process limiter to preserve availability.
 _PUBLIC_PATHS = {"/", "/health", "/health/live", "/health/ready"}
 _RATE_LIMIT_BUCKETS: dict[str, deque[float]] = {}
 _RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMIT_LUA = """
+local key = KEYS[1]
+local now_ms = tonumber(ARGV[1])
+local cutoff_ms = tonumber(ARGV[2])
+local member = ARGV[3]
+local window_ms = tonumber(ARGV[4])
+local limit = tonumber(ARGV[5])
+redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff_ms)
+local count = redis.call('ZCARD', key)
+if count >= limit then
+  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  return {0, oldest[2]}
+end
+redis.call('ZADD', key, now_ms, member)
+redis.call('PEXPIRE', key, window_ms)
+return {1, limit - count - 1}
+"""
+_RATE_LIMIT_REDIS = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
 def _rate_limit_settings() -> tuple[int, int]:
@@ -69,10 +87,51 @@ def _rate_limit_settings() -> tuple[int, int]:
 def _rate_limit_identity(request: Request, configured_key: str) -> str:
     supplied_key = request.headers.get("X-API-Key", "")
     if configured_key and supplied_key:
-        # Never retain the raw API key in the in-memory rate-limit map.
+        # Never retain the raw API key in memory or Redis keys.
         return "key:" + hashlib.sha256(supplied_key.encode("utf-8")).hexdigest()
     client_host = request.client.host if request.client else "unknown"
     return "ip:" + client_host
+
+
+def _local_rate_limit(identity: str, limit: int, window: int, now: float) -> tuple[bool, int, int]:
+    """Per-process fallback; returns (allowed, remaining, retry_after_seconds)."""
+    with _RATE_LIMIT_LOCK:
+        bucket = _RATE_LIMIT_BUCKETS.setdefault(identity, deque())
+        cutoff = now - window
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            retry_after = max(1, int(_math.ceil(window - (now - bucket[0]))))
+            return False, 0, retry_after
+        bucket.append(now)
+        return True, max(0, limit - len(bucket)), 0
+
+
+def _redis_rate_limit(identity: str, limit: int, window: int) -> tuple[bool, int, int]:
+    """Atomically check/update a sliding window in Redis across app workers."""
+    import uuid
+
+    now_ms = int(time.time() * 1000)
+    window_ms = window * 1000
+    # Hash the identity so neither raw client-controlled values nor API keys are
+    # stored in Redis key names.
+    redis_key = "agentflow:rate-limit:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    result = _RATE_LIMIT_REDIS.eval(
+        _RATE_LIMIT_LUA,
+        1,
+        redis_key,
+        now_ms,
+        now_ms - window_ms,
+        f"{now_ms}:{uuid.uuid4().hex}",
+        window_ms,
+        limit,
+    )
+    allowed = bool(int(result[0]))
+    if allowed:
+        return True, max(0, int(result[1])), 0
+    oldest_ms = int(float(result[1]))
+    retry_after = max(1, int(_math.ceil((oldest_ms + window_ms - now_ms) / 1000)))
+    return False, 0, retry_after
 
 
 @app.middleware("http")
@@ -88,32 +147,31 @@ async def api_key_and_rate_limit_middleware(request: Request, call_next):
                 headers={"WWW-Authenticate": "ApiKey"},
             )
 
-    # Keep health checks available to orchestrators. All other routes, including
-    # workflow execution and template endpoints, use a sliding-window limit.
+    # Health endpoints stay available for container orchestration and don't
+    # consume the application request budget.
     if request.url.path in _PUBLIC_PATHS:
         return await call_next(request)
 
     limit, window = _rate_limit_settings()
     identity = _rate_limit_identity(request, configured_key)
-    now = time.monotonic()
-    with _RATE_LIMIT_LOCK:
-        bucket = _RATE_LIMIT_BUCKETS.setdefault(identity, deque())
-        cutoff = now - window
-        while bucket and bucket[0] <= cutoff:
-            bucket.popleft()
-        if len(bucket) >= limit:
-            retry_after = max(1, int(_math.ceil(window - (now - bucket[0]))))
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded. Please retry later."},
-                headers={
-                    "Retry-After": str(retry_after),
-                    "X-RateLimit-Limit": str(limit),
-                    "X-RateLimit-Remaining": "0",
-                },
-            )
-        bucket.append(now)
-        remaining = max(0, limit - len(bucket))
+    try:
+        allowed, remaining, retry_after = _redis_rate_limit(identity, limit, window)
+    except redis.RedisError:
+        logger.warning("rate_limit_redis_unavailable_using_local_fallback", exc_info=True)
+        allowed, remaining, retry_after = _local_rate_limit(
+            identity, limit, window, time.monotonic()
+        )
+
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Please retry later."},
+            headers={
+                "Retry-After": str(retry_after),
+                "X-RateLimit-Limit": str(limit),
+                "X-RateLimit-Remaining": "0",
+            },
+        )
 
     response = await call_next(request)
     response.headers["X-RateLimit-Limit"] = str(limit)
