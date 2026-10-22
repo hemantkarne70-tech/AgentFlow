@@ -4,6 +4,10 @@ from fastapi.testclient import TestClient
 
 from app import main
 
+def force_local_rate_limiter(*args, **kwargs):
+    raise main.redis.ConnectionError(
+        "Force local fallback for legacy tests"
+    )
 
 def reset_buckets():
     with main._RATE_LIMIT_LOCK:
@@ -14,6 +18,7 @@ def test_requests_include_rate_limit_headers(monkeypatch):
     monkeypatch.delenv("AGENTFLOW_API_KEY", raising=False)
     monkeypatch.setenv("AGENTFLOW_RATE_LIMIT", "5")
     monkeypatch.setenv("AGENTFLOW_RATE_WINDOW_SECONDS", "60")
+    monkeypatch.setattr(main, "_redis_rate_limit", force_local_rate_limiter)
     reset_buckets()
     with TestClient(main.app) as client:
         response = client.get("/workflows/runs")
@@ -26,6 +31,7 @@ def test_rate_limit_returns_429_after_limit(monkeypatch):
     monkeypatch.delenv("AGENTFLOW_API_KEY", raising=False)
     monkeypatch.setenv("AGENTFLOW_RATE_LIMIT", "2")
     monkeypatch.setenv("AGENTFLOW_RATE_WINDOW_SECONDS", "60")
+    monkeypatch.setattr(main, "_redis_rate_limit", force_local_rate_limiter)
     reset_buckets()
     with TestClient(main.app) as client:
         first = client.get("/workflows/runs")
