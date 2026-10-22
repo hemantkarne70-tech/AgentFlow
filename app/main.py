@@ -1032,6 +1032,149 @@ def cancel_workflow_run(run_id: int, db: Session = Depends(get_db)):
     raise HTTPException(status_code=409, detail=f"Workflow status '{run.status}' cannot be cancelled.")
 
 
+
+
+@app.get("/workflows/operations/summary")
+def workflow_operations_summary(db: Session = Depends(get_db)):
+    """Return current workflow status counts and execution health indicators."""
+    statuses = ("queued", "running", "completed", "failed", "cancelled")
+    rows = (
+        db.query(WorkflowRun.status, func.count(WorkflowRun.id))
+        .group_by(WorkflowRun.status)
+        .all()
+    )
+    counts = {status: 0 for status in statuses}
+    for status, count in rows:
+        counts[status] = int(count)
+
+    total_runs = sum(counts.values())
+    # Include unknown statuses in the total for visibility rather than silently
+    # excluding rows if a future version introduces a new status.
+    total_runs = int(db.query(func.count(WorkflowRun.id)).scalar() or 0)
+    average_duration = (
+        db.query(func.avg(WorkflowRun.duration_seconds))
+        .filter(WorkflowRun.duration_seconds.isnot(None))
+        .scalar()
+    )
+    recent_failures = (
+        db.query(WorkflowRun)
+        .filter(WorkflowRun.status == "failed")
+        .order_by(WorkflowRun.finished_at.desc(), WorkflowRun.id.desc())
+        .limit(5)
+        .all()
+    )
+    return {
+        "total_runs": total_runs,
+        "status_counts": counts,
+        "average_duration_seconds": (
+            round(float(average_duration), 3) if average_duration is not None else None
+        ),
+        "recent_failures": [
+            {
+                "run_id": run.id,
+                "workflow": run.name,
+                "error": run.error,
+                "created_at": run.created_at,
+                "finished_at": run.finished_at,
+                "duration_seconds": run.duration_seconds,
+            }
+            for run in recent_failures
+        ],
+    }
+
+
+@app.get("/workflows/runs/{run_id}/timeline")
+def get_workflow_run_timeline(run_id: int, db: Session = Depends(get_db)):
+    """Return a chronological lifecycle timeline and step diagnostics for a run."""
+    run = db.get(WorkflowRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+
+    events = (
+        db.query(WorkflowAuditEvent)
+        .filter(WorkflowAuditEvent.run_id == run_id)
+        .order_by(WorkflowAuditEvent.id.asc())
+        .all()
+    )
+    # SQLite can assign WorkflowRun.created_at when the run is flushed, after
+    # synchronous execution has already started/finished. That can make the
+    # "created" audit timestamp later than "started" or "completed". Present
+    # lifecycle events in semantic order and normalize that created timestamp
+    # to the run's earliest lifecycle timestamp for a truthful timeline.
+    lifecycle_order = {
+        "created": 0,
+        "started": 1,
+        "cancellation_requested": 2,
+        "cancelled": 3,
+        "completed": 4,
+        "failed": 4,
+    }
+    events.sort(key=lambda event: (
+        lifecycle_order.get(event.event_type, 3),
+        event.created_at or datetime.min.replace(tzinfo=timezone.utc),
+        event.id,
+    ))
+    traces = (
+        db.query(WorkflowStepTrace)
+        .filter(WorkflowStepTrace.run_id == run_id)
+        .order_by(WorkflowStepTrace.step_number.asc())
+        .all()
+    )
+
+    def _as_utc(value):
+        if value is None:
+            return None
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+    first_at = _as_utc(run.started_at or run.created_at)
+    timeline = []
+    last_elapsed = 0.0
+    for event in events:
+        event_at = _as_utc(event.created_at)
+        # A "created" event for synchronous runs may have inherited a later
+        # DB-default timestamp; the run's start is the earliest known lifecycle
+        # point and is used as the created event's effective time.
+        if event.event_type == "created" and run.started_at is not None:
+            event_at = min(event_at, _as_utc(run.started_at)) if event_at else _as_utc(run.started_at)
+        elapsed = (
+            round(max(last_elapsed, 0.0, (event_at - first_at).total_seconds()), 3)
+            if event_at is not None and first_at is not None else last_elapsed
+        )
+        last_elapsed = elapsed
+        timeline.append({
+            "event_id": event.id,
+            "event_type": event.event_type,
+            "message": event.message,
+            "details": event.details or {},
+            "created_at": event_at,
+            "elapsed_seconds": elapsed,
+        })
+
+    return {
+        "run_id": run.id,
+        "workflow": run.name,
+        "status": run.status,
+        "created_at": run.created_at,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "duration_seconds": run.duration_seconds,
+        "error": run.error,
+        "events": timeline,
+        "step_diagnostics": [
+            {
+                "step_number": trace.step_number,
+                "tool": trace.tool,
+                "status": trace.status,
+                "error": trace.error,
+                "started_at": trace.started_at,
+                "finished_at": trace.finished_at,
+                "duration_seconds": trace.duration_seconds,
+            }
+            for trace in traces
+        ],
+    }
+
+
 @app.get("/workflows/audit")
 def list_workflow_audit_events(
     page: int = Query(1, ge=1),
