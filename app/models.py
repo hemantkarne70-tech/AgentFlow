@@ -22,6 +22,8 @@ class WorkflowRun(Base):
     finished_at = Column(DateTime(timezone=True), nullable=True)
     duration_seconds = Column(Float, nullable=True)
     cancel_requested = Column(Boolean, nullable=False, default=False, index=True)
+    scheduled_for = Column(DateTime(timezone=True), nullable=True, index=True)
+    celery_task_id = Column(String(100), nullable=True, index=True)
 
 
 class WorkflowStepTrace(Base):

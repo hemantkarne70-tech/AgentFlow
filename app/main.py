@@ -2,7 +2,7 @@ import ast
 import math
 import operator
 from typing import Any, Literal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 
 import redis
@@ -58,6 +58,25 @@ def ensure_cancellation_schema() -> None:
 
 
 ensure_cancellation_schema()
+
+
+def ensure_scheduling_schema() -> None:
+    """Add scheduling metadata columns to databases created by earlier milestones."""
+    columns = {column["name"] for column in inspect(engine).get_columns("workflow_runs")}
+    statements = []
+    if "scheduled_for" not in columns:
+        timestamp_type = "TIMESTAMP WITH TIME ZONE" if engine.dialect.name == "postgresql" else "DATETIME"
+        statements.append(f"ALTER TABLE workflow_runs ADD COLUMN scheduled_for {timestamp_type} NULL")
+    if "celery_task_id" not in columns:
+        statements.append("ALTER TABLE workflow_runs ADD COLUMN celery_task_id VARCHAR(100) NULL")
+    if statements:
+        with engine.begin() as connection:
+            for statement in statements:
+                connection.execute(text(statement))
+        logger.info("Added missing workflow scheduling metadata columns")
+
+
+ensure_scheduling_schema()
 
 
 def get_db():
@@ -186,6 +205,23 @@ class WorkflowRequest(BaseModel):
                 raise ValueError("A step can reference only an earlier step.")
         return self
 
+
+
+class ScheduledWorkflowRequest(WorkflowRequest):
+    scheduled_at: datetime
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def validate_scheduled_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("scheduled_at must include a timezone, for example +05:30 or Z.")
+        now = datetime.now(timezone.utc)
+        scheduled_utc = value.astimezone(timezone.utc)
+        if scheduled_utc <= now:
+            raise ValueError("scheduled_at must be in the future.")
+        if scheduled_utc > now + timedelta(days=7):
+            raise ValueError("scheduled_at cannot be more than 7 days in the future.")
+        return scheduled_utc
 
 
 class WorkflowTemplateRequest(BaseModel):
@@ -499,6 +535,65 @@ def execute_workflow_async(
     }
 
 
+@app.post("/workflows/schedule", status_code=202)
+def schedule_workflow(
+    workflow: ScheduledWorkflowRequest,
+    db: Session = Depends(get_db),
+):
+    """Schedule a workflow for a timezone-aware time within the next seven days."""
+    run = WorkflowRun(
+        name=workflow.name,
+        status="queued",
+        total_steps=0,
+        results=[],
+        error=None,
+        scheduled_for=workflow.scheduled_at,
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    steps = [step.model_dump(exclude_none=True) for step in workflow.steps]
+    try:
+        task = execute_workflow_task.apply_async(
+            args=[run.id, steps],
+            eta=workflow.scheduled_at,
+        )
+    except Exception as exc:
+        logger.exception("Could not schedule workflow run %s", run.id)
+        now = datetime.now(timezone.utc)
+        started_at = run.created_at or now
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        run.status = "failed"
+        run.error = f"Could not schedule workflow: {type(exc).__name__}: {exc}"
+        run.started_at = started_at
+        run.finished_at = now
+        run.duration_seconds = round(max(0.0, (now - started_at).total_seconds()), 3)
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "run_id": run.id,
+                "message": "Unable to schedule workflow. Check Redis and Celery configuration.",
+                "status": run.status,
+            },
+        ) from exc
+
+    run.celery_task_id = task.id
+    db.commit()
+    db.refresh(run)
+    return {
+        "run_id": run.id,
+        "task_id": task.id,
+        "workflow": run.name,
+        "status": run.status,
+        "scheduled_for": run.scheduled_for,
+        "status_url": f"/workflows/runs/{run.id}",
+        "message": "Workflow scheduled successfully.",
+    }
+
+
 @app.get("/workflows/runs")
 def list_workflow_runs(
     page: int = Query(1, ge=1),
@@ -692,6 +787,8 @@ def get_workflow_run(
         ],
         "error": run.error,
         "created_at": run.created_at,
+        "scheduled_for": getattr(run, "scheduled_for", None),
+        "celery_task_id": getattr(run, "celery_task_id", None),
         "started_at": run.started_at,
         "finished_at": run.finished_at,
         "duration_seconds": run.duration_seconds,
