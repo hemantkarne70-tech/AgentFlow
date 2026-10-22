@@ -399,6 +399,22 @@ class WorkflowRequest(BaseModel):
 
 
 
+class BulkCancelRequest(BaseModel):
+    """Request to cancel multiple workflow runs in one operation."""
+
+    run_ids: list[int] = Field(min_length=1, max_length=100)
+    dry_run: bool = False
+
+    @field_validator("run_ids")
+    @classmethod
+    def validate_run_ids(cls, value: list[int]) -> list[int]:
+        if any(run_id < 1 for run_id in value):
+            raise ValueError("run_ids must contain positive integers.")
+        if len(set(value)) != len(value):
+            raise ValueError("run_ids must not contain duplicates.")
+        return value
+
+
 class ScheduledWorkflowRequest(WorkflowRequest):
     scheduled_at: datetime
 
@@ -1321,6 +1337,115 @@ def cancel_workflow_run(run_id: int, db: Session = Depends(get_db)):
 
 
 
+
+
+@app.post("/workflows/runs/bulk-cancel")
+def bulk_cancel_workflow_runs(
+    request: BulkCancelRequest,
+    db: Session = Depends(get_db),
+):
+    """Cancel eligible runs in one request, with optional dry-run preview.
+
+    Queued runs are marked cancelled immediately. Running runs receive a
+    cooperative cancellation request. Missing and terminal runs are reported
+    individually and do not prevent other eligible runs from being processed.
+    """
+    now = datetime.now(timezone.utc)
+    results = []
+    changed = False
+
+    for run_id in request.run_ids:
+        run = db.get(WorkflowRun, run_id)
+        if run is None:
+            results.append({"run_id": run_id, "outcome": "not_found"})
+            continue
+
+        if run.status in {"completed", "failed", "cancelled"}:
+            results.append({
+                "run_id": run_id,
+                "outcome": "already_terminal",
+                "status": run.status,
+            })
+            continue
+
+        if run.status not in {"queued", "running"}:
+            results.append({
+                "run_id": run_id,
+                "outcome": "not_cancellable",
+                "status": run.status,
+            })
+            continue
+
+        if request.dry_run:
+            results.append({
+                "run_id": run_id,
+                "outcome": (
+                    "would_cancel" if run.status == "queued"
+                    else "would_request_cancellation"
+                ),
+                "status": run.status,
+            })
+            continue
+
+        if run.status == "queued":
+            started_at = run.started_at or run.created_at or now
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            run.cancel_requested = True
+            run.status = "cancelled"
+            run.error = "Workflow cancelled before execution started."
+            run.started_at = started_at
+            run.finished_at = now
+            run.duration_seconds = round(
+                max(0.0, (now - started_at).total_seconds()), 3
+            )
+            record_audit_event(
+                db,
+                run.id,
+                "cancelled",
+                "Queued workflow cancelled through bulk cancellation.",
+                created_at=now,
+            )
+            results.append({
+                "run_id": run_id,
+                "outcome": "cancelled",
+                "status": run.status,
+            })
+        else:
+            run.cancel_requested = True
+            record_audit_event(
+                db,
+                run.id,
+                "cancellation_requested",
+                "Cancellation requested through bulk cancellation.",
+                created_at=now,
+            )
+            results.append({
+                "run_id": run_id,
+                "outcome": "cancellation_requested",
+                "status": run.status,
+            })
+        changed = True
+
+    if changed:
+        db.commit()
+        for item in results:
+            if item["outcome"] in {"cancelled", "cancellation_requested"}:
+                run = db.get(WorkflowRun, item["run_id"])
+                if run is not None:
+                    item["status"] = run.status
+
+    counts = {}
+    for item in results:
+        outcome = item["outcome"]
+        counts[outcome] = counts.get(outcome, 0) + 1
+
+    return {
+        "dry_run": request.dry_run,
+        "requested": len(request.run_ids),
+        "counts": counts,
+        "results": results,
+    }
 
 
 @app.get("/workflows/operations/stuck")
