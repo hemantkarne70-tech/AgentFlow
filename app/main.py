@@ -38,6 +38,7 @@ from app.workflow_runtime import (
 )
 
 from app.config import APP_NAME, APP_VERSION, REDIS_URL
+from app.metrics import PrometheusMetricsMiddleware, render_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ app = FastAPI(
     description="A lightweight workflow execution engine.",
     version="0.1.0",
 )
+app.add_middleware(PrometheusMetricsMiddleware)
 
 # Optional API-key protection and Redis-backed sliding-window rate limiting.
 # Redis shares counters across FastAPI workers/instances. If Redis is unavailable,
@@ -487,6 +489,15 @@ def health_live():
         "application": APP_NAME,
         "version": APP_VERSION,
     }
+
+
+@app.get("/metrics", include_in_schema=False)
+def prometheus_metrics():
+    """Expose Prometheus-compatible HTTP request and latency metrics."""
+    return Response(
+        content=render_metrics(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 @app.get("/health/ready")
