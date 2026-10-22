@@ -1012,9 +1012,13 @@ def list_workflow_runs(
     per_page: int = Query(10, ge=1, le=100),
     status: str | None = None,
     search: str | None = None,
+    date_from: datetime | None = Query(default=None, description="Inclusive creation-time lower bound (ISO 8601)."),
+    date_to: datetime | None = Query(default=None, description="Inclusive creation-time upper bound (ISO 8601)."),
+    outcome: str | None = Query(default=None, description="Outcome group: success, failure, active, or cancelled."),
     db: Session = Depends(get_db),
 ):
-    allowed_statuses = {"queued", "running", "completed", "failed"}
+    allowed_statuses = {"queued", "running", "completed", "failed", "cancelled"}
+    allowed_outcomes = {"success", "failure", "active", "cancelled"}
 
     if status is not None:
         status = status.strip().lower()
@@ -1027,6 +1031,20 @@ def list_workflow_runs(
                 },
             )
 
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from must be earlier than or equal to date_to.")
+
+    if outcome is not None:
+        outcome = outcome.strip().lower()
+        if outcome not in allowed_outcomes:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Invalid workflow outcome.",
+                    "allowed_outcomes": sorted(allowed_outcomes),
+                },
+            )
+
     query = db.query(WorkflowRun)
 
     if status:
@@ -1036,6 +1054,20 @@ def list_workflow_runs(
         query = query.filter(
             WorkflowRun.name.ilike(f"%{search.strip()}%")
         )
+
+    if date_from is not None:
+        query = query.filter(WorkflowRun.created_at >= date_from)
+    if date_to is not None:
+        query = query.filter(WorkflowRun.created_at <= date_to)
+
+    if outcome == "success":
+        query = query.filter(WorkflowRun.status == "completed")
+    elif outcome == "failure":
+        query = query.filter(WorkflowRun.status == "failed")
+    elif outcome == "active":
+        query = query.filter(WorkflowRun.status.in_(("queued", "running")))
+    elif outcome == "cancelled":
+        query = query.filter(WorkflowRun.status == "cancelled")
 
     total = query.count()
     total_pages = (total + per_page - 1) // per_page
@@ -1073,7 +1105,83 @@ def list_workflow_runs(
         "filters": {
             "status": status,
             "search": search.strip() if search and search.strip() else None,
+            "date_from": date_from,
+            "date_to": date_to,
+            "outcome": outcome,
         },
+    }
+
+
+@app.get("/workflows/dashboard")
+def workflow_dashboard(
+    recent_limit: int = Query(default=10, ge=1, le=50),
+    db: Session = Depends(get_db),
+):
+    """Return a compact dashboard payload for runs, failures, and recurring schedules."""
+    status_names = ("queued", "running", "completed", "failed", "cancelled")
+    status_rows = (
+        db.query(WorkflowRun.status, func.count(WorkflowRun.id))
+        .group_by(WorkflowRun.status)
+        .all()
+    )
+    status_counts = {name: 0 for name in status_names}
+    for name, count in status_rows:
+        if name in status_counts:
+            status_counts[name] = int(count)
+
+    total_runs = int(db.query(func.count(WorkflowRun.id)).scalar() or 0)
+    average_duration = (
+        db.query(func.avg(WorkflowRun.duration_seconds))
+        .filter(WorkflowRun.duration_seconds.isnot(None))
+        .scalar()
+    )
+    recent_runs = (
+        db.query(WorkflowRun)
+        .order_by(WorkflowRun.id.desc())
+        .limit(recent_limit)
+        .all()
+    )
+    recent_failures = (
+        db.query(WorkflowRun)
+        .filter(WorkflowRun.status == "failed")
+        .order_by(WorkflowRun.finished_at.desc(), WorkflowRun.id.desc())
+        .limit(min(recent_limit, 10))
+        .all()
+    )
+    schedule_counts = {
+        "total": int(db.query(func.count(WorkflowSchedule.id)).scalar() or 0),
+        "enabled": int(
+            db.query(func.count(WorkflowSchedule.id))
+            .filter(WorkflowSchedule.enabled.is_(True)).scalar() or 0
+        ),
+        "paused": int(
+            db.query(func.count(WorkflowSchedule.id))
+            .filter(WorkflowSchedule.enabled.is_(False)).scalar() or 0
+        ),
+    }
+
+    def run_payload(run):
+        return {
+            "id": run.id,
+            "name": run.name,
+            "status": run.status,
+            "total_steps": run.total_steps,
+            "error": run.error,
+            "created_at": run.created_at,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "duration_seconds": run.duration_seconds,
+        }
+
+    return {
+        "total_runs": total_runs,
+        "status_counts": status_counts,
+        "average_duration_seconds": (
+            round(float(average_duration), 3) if average_duration is not None else None
+        ),
+        "schedules": schedule_counts,
+        "recent_runs": [run_payload(run) for run in recent_runs],
+        "recent_failures": [run_payload(run) for run in recent_failures],
     }
 
 
