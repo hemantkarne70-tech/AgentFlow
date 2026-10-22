@@ -16,7 +16,7 @@ from collections import deque
 
 import redis
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -1034,6 +1034,149 @@ def cancel_workflow_run(run_id: int, db: Session = Depends(get_db)):
 
 
 
+
+@app.get("/workflows/operations/stuck")
+def list_stuck_workflows(
+    threshold_seconds: int = Query(default=900, ge=1, le=86400),
+    db: Session = Depends(get_db),
+):
+    """List queued/running workflows whose last known activity is too old."""
+    now = datetime.now(timezone.utc)
+    candidates = (
+        db.query(WorkflowRun)
+        .filter(WorkflowRun.status.in_(("queued", "running")))
+        .order_by(WorkflowRun.created_at.asc(), WorkflowRun.id.asc())
+        .all()
+    )
+    stuck = []
+    for run in candidates:
+        reference_time = run.started_at if run.status == "running" and run.started_at else run.created_at
+        if reference_time is None:
+            continue
+        if reference_time.tzinfo is None:
+            reference_time = reference_time.replace(tzinfo=timezone.utc)
+        age_seconds = max(0.0, (now - reference_time).total_seconds())
+        if age_seconds >= threshold_seconds:
+            stuck.append({
+                "run_id": run.id,
+                "workflow": run.name,
+                "status": run.status,
+                "age_seconds": round(age_seconds, 3),
+                "reference_time": reference_time,
+                "threshold_seconds": threshold_seconds,
+                "celery_task_id": run.celery_task_id,
+            })
+    return {"threshold_seconds": threshold_seconds, "count": len(stuck), "workflows": stuck}
+
+
+@app.post("/workflows/runs/{run_id}/retry", status_code=202)
+def retry_failed_workflow(
+    run_id: int,
+    workflow: WorkflowRequest,
+    idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=128),
+    db: Session = Depends(get_db),
+):
+    """Create a new run for a failed workflow, with idempotent retry submission.
+
+    The original step definition is not persisted in WorkflowRun, so the caller
+    must provide the validated workflow definition again. A retry creates a new
+    run and never overwrites the original failure record.
+    """
+    source = db.get(WorkflowRun, run_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+    if source.status != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only failed workflows can be retried (current status: {source.status}).",
+        )
+
+    # Idempotency is scoped to the original failed run. Repeating the same key
+    # returns the already-created retry rather than queueing duplicate work.
+    prior_events = (
+        db.query(WorkflowAuditEvent)
+        .filter(
+            WorkflowAuditEvent.run_id == source.id,
+            WorkflowAuditEvent.event_type == "retry_requested",
+        )
+        .order_by(WorkflowAuditEvent.id.desc())
+        .all()
+    )
+    for event in prior_events:
+        details = event.details or {}
+        if details.get("idempotency_key") == idempotency_key:
+            retry_run_id = details.get("retry_run_id")
+            retry_run = db.get(WorkflowRun, retry_run_id) if retry_run_id else None
+            if retry_run is not None:
+                return {
+                    "run_id": retry_run.id,
+                    "source_run_id": source.id,
+                    "status": retry_run.status,
+                    "duplicate_request": True,
+                    "message": "This idempotency key already created this retry run.",
+                }
+
+    retry_run = WorkflowRun(
+        name=workflow.name,
+        status="queued",
+        total_steps=0,
+        results=[],
+        error=None,
+    )
+    db.add(retry_run)
+    db.flush()
+    record_audit_event(
+        db, retry_run.id, "created", "Workflow retry created and queued.",
+        details={"source_run_id": source.id},
+    )
+    record_audit_event(
+        db, source.id, "retry_requested", "A retry run was created for this failed workflow.",
+        details={
+            "retry_run_id": retry_run.id,
+            "idempotency_key": idempotency_key,
+        },
+    )
+    db.commit()
+    db.refresh(retry_run)
+
+    steps = [step.model_dump(exclude_none=True) for step in workflow.steps]
+    try:
+        task = execute_workflow_task.delay(retry_run.id, steps)
+        retry_run.celery_task_id = task.id
+        db.commit()
+    except Exception as exc:
+        logger.exception("Could not enqueue retry run %s", retry_run.id)
+        finished_at = datetime.now(timezone.utc)
+        retry_run.status = "failed"
+        retry_run.error = f"Could not enqueue retry: {type(exc).__name__}: {exc}"
+        retry_run.finished_at = finished_at
+        retry_run.duration_seconds = 0.0
+        record_audit_event(
+            db, retry_run.id, "failed", "Workflow retry failed while being queued.",
+            details={"source_run_id": source.id, "error": retry_run.error},
+            created_at=finished_at,
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "run_id": retry_run.id,
+                "source_run_id": source.id,
+                "message": "Retry could not be queued; inspect the audit trail before resubmitting.",
+            },
+        ) from exc
+
+    return {
+        "run_id": retry_run.id,
+        "source_run_id": source.id,
+        "task_id": task.id,
+        "workflow": retry_run.name,
+        "status": retry_run.status,
+        "duplicate_request": False,
+        "status_url": f"/workflows/runs/{retry_run.id}",
+    }
+
+
 @app.get("/workflows/operations/summary")
 def workflow_operations_summary(db: Session = Depends(get_db)):
     """Return current workflow status counts and execution health indicators."""
@@ -1108,6 +1251,7 @@ def get_workflow_run_timeline(run_id: int, db: Session = Depends(get_db)):
         "cancelled": 3,
         "completed": 4,
         "failed": 4,
+        "retry_requested": 5,
     }
     events.sort(key=lambda event: (
         lifecycle_order.get(event.event_type, 3),
