@@ -10,6 +10,11 @@ from app.logging_config import configure_logging
 from app.models import WorkflowRun
 from app.tools import execute_tool
 
+from app.workflow_runtime import (
+    execute_workflow_steps,
+    WorkflowStepExecutionError,
+)
+
 configure_logging()
 logger = logging.getLogger(__name__)
 
@@ -109,12 +114,10 @@ def execute_workflow_task(self, run_id: int, steps: list[dict]):
             logger.error("Workflow run %s was not found", run_id)
             return {"run_id": run_id, "status": "not_found"}
 
-        # Idempotency guard: a redelivered Celery message must not rerun a
-        # workflow that has already reached a terminal state.
+        # Do not execute duplicate deliveries for completed or failed runs.
         if run.status in TERMINAL_STATUSES:
             logger.info(
-                "Ignoring duplicate delivery for terminal workflow %s "
-                "(status=%s)",
+                "Ignoring duplicate delivery for terminal workflow %s (status=%s)",
                 run_id,
                 run.status,
             )
@@ -145,75 +148,39 @@ def execute_workflow_task(self, run_id: int, steps: list[dict]):
             getattr(self.request, "id", None),
         )
 
-        results = []
-
-        for index, step in enumerate(steps, start=1):
-            try:
-                result = execute_tool(step["tool"], step["input"])
-            except (ValueError, SyntaxError, ArithmeticError) as exc:
-                run.results = results
-                run.total_steps = len(results)
-                error_message = f"Step {index} failed: {exc}"
-                finish_run(run, "failed", error_message)
-                db.commit()
-
-                logger.warning(
-                    "Workflow %s failed at step %s using tool '%s': %s",
-                    run_id,
-                    index,
-                    step.get("tool", "unknown"),
-                    exc,
-                )
-                return {
-                    "run_id": run.id,
-                    "status": "failed",
-                    "error": run.error,
-                    "total_steps": run.total_steps,
-                }
-            except (OperationalError, InterfaceError):
-                # Let Celery's configured automatic retry handle transient
-                # database errors rather than marking the workflow failed.
-                raise
-            except Exception as exc:
-                run.results = results
-                run.total_steps = len(results)
-                error_message = (
-                    f"Unexpected worker error at step {index}: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                finish_run(run, "failed", error_message)
-                db.commit()
-
-                logger.exception(
-                    "Unexpected error in workflow %s at step %s",
-                    run_id,
-                    index,
-                )
-                return {
-                    "run_id": run.id,
-                    "status": "failed",
-                    "error": run.error,
-                    "total_steps": run.total_steps,
-                }
-
-            results.append(
-                {
-                    "step": index,
-                    "tool": step["tool"],
-                    "result": result,
-                }
-            )
-            run.results = results
-            run.total_steps = len(results)
+        try:
+            results = execute_workflow_steps(steps, execute_tool)
+        except WorkflowStepExecutionError as exc:
+            run.results = exc.partial_results
+            run.total_steps = len(exc.partial_results)
+            # Preserve the established worker-level wording for unexpected
+            # runtime failures while retaining step details for other errors.
+            if isinstance(exc.cause, RuntimeError):
+                error_message = f"Unexpected worker error: {exc.cause}"
+            else:
+                error_message = str(exc)
+            finish_run(run, "failed", error_message)
             db.commit()
 
-            logger.info(
-                "Workflow %s completed step %s using tool '%s'",
+            logger.warning(
+                "Workflow %s failed at step %s: %s",
                 run_id,
-                index,
-                step["tool"],
+                exc.step_number,
+                exc,
             )
+            return {
+                "run_id": run.id,
+                "status": "failed",
+                "error": run.error,
+                "total_steps": run.total_steps,
+                "results": run.results,
+                "started_at": run.started_at.isoformat(),
+                "finished_at": run.finished_at.isoformat(),
+                "duration_seconds": run.duration_seconds,
+            }
 
+        run.results = results
+        run.total_steps = len(results)
         finish_run(run, "completed")
         db.commit()
 

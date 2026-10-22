@@ -8,9 +8,8 @@ import logging
 import redis
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from fastapi import Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -21,6 +20,11 @@ from app.ai_planner import (
     AIConfigurationError,
     AIPlanningError,
     generate_workflow_plan,
+)
+
+from app.workflow_runtime import (
+    execute_workflow_steps,
+    WorkflowStepExecutionError,
 )
 
 from app.config import APP_NAME, APP_VERSION, REDIS_URL
@@ -108,20 +112,34 @@ def safe_calculate(expression: str) -> int | float:
 
     return evaluate(tree)
 
+class StepInputReference(BaseModel):
+    step: int = Field(ge=1)
+    field: str | None = Field(default=None, max_length=100)
+
+    @field_validator("field")
+    @classmethod
+    def field_not_blank(cls, value):
+        if value is not None and not value.strip():
+            raise ValueError("Reference field cannot be blank.")
+        return value
 
 class WorkflowStep(BaseModel):
     tool: Literal["calculator", "uppercase", "word_count"]
-    input: str = Field(
-        min_length=1,
-        max_length=500,
-    )
+    input: str = Field(default="", max_length=500)
+    input_from: StepInputReference | None = None
 
-    @field_validator("input")
-    @classmethod
-    def validate_input_not_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("Step input cannot be blank.")
-        return value
+    def model_dump(self, *args, **kwargs):
+        # Keep absent optional fields out of the default serialized shape.
+        kwargs.setdefault("exclude_none", True)
+        return super().model_dump(*args, **kwargs)
+
+    @model_validator(mode="after")
+    def validate_input_source(self):
+        if self.input_from is None and not self.input.strip():
+            raise ValueError("Provide a nonblank input or input_from reference.")
+        if self.input_from is not None and self.input.strip():
+            raise ValueError("Provide either input or input_from, not both.")
+        return self
 
 
 class WorkflowRequest(BaseModel):
@@ -140,6 +158,13 @@ class WorkflowRequest(BaseModel):
         if not value.strip():
             raise ValueError("Workflow name cannot be blank.")
         return value
+
+    @model_validator(mode="after")
+    def validate_step_references(self):
+        for index, step in enumerate(self.steps, start=1):
+            if step.input_from and step.input_from.step >= index:
+                raise ValueError("A step can reference only an earlier step.")
+        return self
 
 
 def execute_tool(tool: str, value: str) -> Any:
@@ -252,7 +277,7 @@ def plan_ai_workflow(request: AIWorkflowRequest):
 
     return {
         "workflow": plan.name,
-        "steps": [step.model_dump() for step in plan.steps],
+        "steps": [step.model_dump(exclude_none=True) for step in plan.steps],
         "total_steps": len(plan.steps),
         "execution_started": False,
     }
@@ -277,7 +302,7 @@ def execute_ai_workflow(
 
     workflow = WorkflowRequest(
         name=plan.name,
-        steps=[step.model_dump() for step in plan.steps],
+        steps=[step.model_dump(exclude_none=True) for step in plan.steps],
     )
 
     # Reuse the established async enqueue path and run tracking.
@@ -289,35 +314,22 @@ def execute_workflow(
     workflow: WorkflowRequest,
     db: Session = Depends(get_db),
 ):
+    """Execute a workflow synchronously and persist its run record."""
     started_at = datetime.now(timezone.utc)
-    results = []
+    steps = [step.model_dump(exclude_none=True) for step in workflow.steps]
     error_message = None
 
-    for index, step in enumerate(workflow.steps, start=1):
-        try:
-            result = execute_tool(step.tool, step.input)
-        except (
-            ValueError,
-            SyntaxError,
-            ArithmeticError,
-        ) as exc:
-            error_message = f"Step {index} failed: {exc}"
-            break
-
-        results.append(
-            {
-                "step": index,
-                "tool": step.tool,
-                "result": result,
-            }
-        )
+    try:
+        results = execute_workflow_steps(steps, execute_tool)
+    except WorkflowStepExecutionError as exc:
+        results = exc.partial_results
+        error_message = str(exc)
 
     finished_at = datetime.now(timezone.utc)
     duration_seconds = round(
         max(0.0, (finished_at - started_at).total_seconds()),
         3,
     )
-
     status = "failed" if error_message else "completed"
 
     run = WorkflowRun(
@@ -330,30 +342,26 @@ def execute_workflow(
         finished_at=finished_at,
         duration_seconds=duration_seconds,
     )
-
     db.add(run)
     db.commit()
     db.refresh(run)
 
     if error_message:
         raise HTTPException(
-        status_code=400,
-        detail={
-            "run_id": run.id,
-            "message": error_message,
-            "started_at": (
-                run.started_at.isoformat()
-                if run.started_at
-                else None
-            ),
-            "finished_at": (
-                run.finished_at.isoformat()
-                if run.finished_at
-                else None
-            ),
-            "duration_seconds": run.duration_seconds,
-        },
-    )
+            status_code=400,
+            detail={
+                "run_id": run.id,
+                "message": error_message,
+                "results": run.results,
+                "started_at": (
+                    run.started_at.isoformat() if run.started_at else None
+                ),
+                "finished_at": (
+                    run.finished_at.isoformat() if run.finished_at else None
+                ),
+                "duration_seconds": run.duration_seconds,
+            },
+        )
 
     return {
         "run_id": run.id,
@@ -366,13 +374,14 @@ def execute_workflow(
         "finished_at": run.finished_at,
         "duration_seconds": run.duration_seconds,
     }
-    
+
 
 @app.post("/workflows/execute-async", status_code=202)
 def execute_workflow_async(
     workflow: WorkflowRequest,
     db: Session = Depends(get_db),
 ):
+    """Persist a queued run and hand execution to Celery."""
     run = WorkflowRun(
         name=workflow.name,
         status="queued",
@@ -380,30 +389,17 @@ def execute_workflow_async(
         results=[],
         error=None,
     )
-
     db.add(run)
     db.commit()
     db.refresh(run)
 
-    steps = [
-        step.model_dump()
-        for step in workflow.steps
-    ]
-
+    steps = [step.model_dump(exclude_none=True) for step in workflow.steps]
     try:
         task = execute_workflow_task.delay(run.id, steps)
-
     except Exception as exc:
+        logger.exception("Could not enqueue workflow run %s", run.id)
         finished_at = datetime.now(timezone.utc)
-
-        started_at = getattr(run, "started_at", None)
-        if started_at is None:
-            started_at = getattr(run, "created_at", None)
-
-        if started_at is None:
-            started_at = finished_at
-
-        # Normalize SQLite's timezone-naive datetime before subtraction.
+        started_at = getattr(run, "started_at", None) or run.created_at or finished_at
         if started_at.tzinfo is None:
             started_at = started_at.replace(tzinfo=timezone.utc)
 
@@ -418,15 +414,12 @@ def execute_workflow_async(
         db.commit()
         db.refresh(run)
 
-        logger.exception("Could not enqueue workflow run %s", run.id)
-
         raise HTTPException(
             status_code=503,
             detail={
                 "run_id": run.id,
                 "message": (
-                    "Unable to queue workflow. "
-                    "Check Redis and Celery configuration."
+                    "Unable to queue workflow. Check Redis and Celery configuration."
                 ),
                 "status": run.status,
                 "started_at": run.started_at.isoformat(),
@@ -443,7 +436,7 @@ def execute_workflow_async(
         "status_url": f"/workflows/runs/{run.id}",
     }
 
-    
+
 @app.get("/workflows/runs")
 def list_workflow_runs(
     page: int = Query(1, ge=1),
