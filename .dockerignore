@@ -1,0 +1,16 @@
+.git
+.venv
+venv
+__pycache__
+**/__pycache__
+.pytest_cache
+.coverage
+htmlcov
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+agentflow_source.zip
+agentflow_milestone19.zip
