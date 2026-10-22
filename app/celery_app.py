@@ -6,6 +6,7 @@ celery_app = Celery(
     "agentflow",
     broker=REDIS_URL,
     backend=REDIS_URL,
+    include=["app.tasks"],
 )
 
 celery_app.conf.update(

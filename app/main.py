@@ -17,6 +17,11 @@ from sqlalchemy import text
 from app.db import Base, SessionLocal, engine
 from app.models import WorkflowRun
 from app.tasks import execute_workflow_task
+from app.ai_planner import (
+    AIConfigurationError,
+    AIPlanningError,
+    generate_workflow_plan,
+)
 
 from app.config import APP_NAME, APP_VERSION, REDIS_URL
 
@@ -217,6 +222,66 @@ def health_ready():
         "status": "ready",
         "checks": checks,
     }
+
+
+
+class AIWorkflowRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Prompt cannot be blank.")
+        return value.strip()
+
+
+@app.post("/workflows/plan")
+def plan_ai_workflow(request: AIWorkflowRequest):
+    """Generate a validated workflow plan without executing it."""
+    try:
+        plan = generate_workflow_plan(request.prompt)
+    except AIConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except AIPlanningError as exc:
+        logger.exception("AI workflow planning failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI workflow planning failed: {exc}",
+        ) from exc
+
+    return {
+        "workflow": plan.name,
+        "steps": [step.model_dump() for step in plan.steps],
+        "total_steps": len(plan.steps),
+        "execution_started": False,
+    }
+
+
+@app.post("/workflows/execute-ai", status_code=202)
+def execute_ai_workflow(
+    request: AIWorkflowRequest,
+    db: Session = Depends(get_db),
+):
+    """Plan a workflow with AI, then queue it using the normal Celery path."""
+    try:
+        plan = generate_workflow_plan(request.prompt)
+    except AIConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except AIPlanningError as exc:
+        logger.exception("AI workflow planning failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"AI workflow planning failed: {exc}",
+        ) from exc
+
+    workflow = WorkflowRequest(
+        name=plan.name,
+        steps=[step.model_dump() for step in plan.steps],
+    )
+
+    # Reuse the established async enqueue path and run tracking.
+    return execute_workflow_async(workflow=workflow, db=db)
 
 
 @app.post("/workflows/execute")
