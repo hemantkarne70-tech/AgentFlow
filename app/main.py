@@ -6,6 +6,11 @@ from datetime import datetime, timedelta, timezone
 import logging
 import hmac
 import os
+import hashlib
+import math as _math
+import threading
+import time
+from collections import deque
 
 import redis
 
@@ -40,31 +45,80 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Optional API-key protection. Set AGENTFLOW_API_KEY in the environment to enable it.
+# Optional API-key protection and in-process sliding-window rate limiting.
+# Configure a key before exposing this service outside a trusted environment.
 # Liveness/readiness endpoints remain public for container orchestration.
 _PUBLIC_PATHS = {"/", "/health", "/health/live", "/health/ready"}
+_RATE_LIMIT_BUCKETS: dict[str, deque[float]] = {}
+_RATE_LIMIT_LOCK = threading.Lock()
+
+
+def _rate_limit_settings() -> tuple[int, int]:
+    """Return (request limit, window seconds), with safe positive defaults."""
+    try:
+        limit = int(os.getenv("AGENTFLOW_RATE_LIMIT", "120"))
+    except (TypeError, ValueError):
+        limit = 120
+    try:
+        window = int(os.getenv("AGENTFLOW_RATE_WINDOW_SECONDS", "60"))
+    except (TypeError, ValueError):
+        window = 60
+    return max(1, min(limit, 100_000)), max(1, min(window, 86_400))
+
+
+def _rate_limit_identity(request: Request, configured_key: str) -> str:
+    supplied_key = request.headers.get("X-API-Key", "")
+    if configured_key and supplied_key:
+        # Never retain the raw API key in the in-memory rate-limit map.
+        return "key:" + hashlib.sha256(supplied_key.encode("utf-8")).hexdigest()
+    client_host = request.client.host if request.client else "unknown"
+    return "ip:" + client_host
 
 
 @app.middleware("http")
-async def api_key_middleware(request: Request, call_next):
+async def api_key_and_rate_limit_middleware(request: Request, call_next):
     configured_key = os.getenv("AGENTFLOW_API_KEY", "").strip()
-    if not configured_key:
-        # Local development remains frictionless. Configure a key before exposing
-        # this service outside a trusted development environment.
-        return await call_next(request)
 
+    if configured_key and request.url.path not in _PUBLIC_PATHS:
+        supplied_key = request.headers.get("X-API-Key", "")
+        if not supplied_key or not hmac.compare_digest(supplied_key, configured_key):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing or invalid API key."},
+                headers={"WWW-Authenticate": "ApiKey"},
+            )
+
+    # Keep health checks available to orchestrators. All other routes, including
+    # workflow execution and template endpoints, use a sliding-window limit.
     if request.url.path in _PUBLIC_PATHS:
         return await call_next(request)
 
-    supplied_key = request.headers.get("X-API-Key", "")
-    if not supplied_key or not hmac.compare_digest(supplied_key, configured_key):
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Missing or invalid API key."},
-            headers={"WWW-Authenticate": "ApiKey"},
-        )
+    limit, window = _rate_limit_settings()
+    identity = _rate_limit_identity(request, configured_key)
+    now = time.monotonic()
+    with _RATE_LIMIT_LOCK:
+        bucket = _RATE_LIMIT_BUCKETS.setdefault(identity, deque())
+        cutoff = now - window
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            retry_after = max(1, int(_math.ceil(window - (now - bucket[0]))))
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Please retry later."},
+                headers={
+                    "Retry-After": str(retry_after),
+                    "X-RateLimit-Limit": str(limit),
+                    "X-RateLimit-Remaining": "0",
+                },
+            )
+        bucket.append(now)
+        remaining = max(0, limit - len(bucket))
 
-    return await call_next(request)
+    response = await call_next(request)
+    response.headers["X-RateLimit-Limit"] = str(limit)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+    return response
 
 Base.metadata.create_all(bind=engine)
 
