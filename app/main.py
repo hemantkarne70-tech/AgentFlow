@@ -24,7 +24,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, inspect, text
 
 from app.db import Base, SessionLocal, engine
-from app.models import WorkflowRun, WorkflowStepTrace, WorkflowTemplate
+from app.models import WorkflowRun, WorkflowStepTrace, WorkflowTemplate, WorkflowAuditEvent
+from app.audit import record_audit_event
 from app.tasks import execute_workflow_task
 from app.ai_planner import (
     AIConfigurationError,
@@ -638,8 +639,22 @@ def execute_workflow(
     )
     db.add(run)
     db.flush()
+    record_audit_event(
+        db, run.id, "created", "Workflow run created.",
+        details={"workflow": run.name}, created_at=run.created_at,
+    )
+    record_audit_event(
+        db, run.id, "started", "Workflow execution started.",
+        created_at=started_at,
+    )
     for trace in step_traces:
         db.add(WorkflowStepTrace(run_id=run.id, **trace))
+    record_audit_event(
+        db, run.id, status, f"Workflow {status}.",
+        details={"total_steps": run.total_steps, "duration_seconds": duration_seconds,
+                 **({"error": error_message} if error_message else {})},
+        created_at=finished_at,
+    )
     db.commit()
     db.refresh(run)
 
@@ -687,6 +702,11 @@ def execute_workflow_async(
         error=None,
     )
     db.add(run)
+    db.flush()
+    record_audit_event(
+        db, run.id, "created", "Workflow run created and queued.",
+        details={"workflow": run.name},
+    )
     db.commit()
     db.refresh(run)
 
@@ -707,6 +727,10 @@ def execute_workflow_async(
         run.duration_seconds = round(
             max(0.0, (finished_at - started_at).total_seconds()),
             3,
+        )
+        record_audit_event(
+            db, run.id, "failed", "Workflow failed while being queued.",
+            details={"error": run.error}, created_at=finished_at,
         )
         db.commit()
         db.refresh(run)
@@ -749,6 +773,11 @@ def schedule_workflow(
         scheduled_for=workflow.scheduled_at,
     )
     db.add(run)
+    db.flush()
+    record_audit_event(
+        db, run.id, "created", "Workflow run created and scheduled.",
+        details={"workflow": run.name, "scheduled_for": workflow.scheduled_at.isoformat()},
+    )
     db.commit()
     db.refresh(run)
 
@@ -769,6 +798,10 @@ def schedule_workflow(
         run.started_at = started_at
         run.finished_at = now
         run.duration_seconds = round(max(0.0, (now - started_at).total_seconds()), 3)
+        record_audit_event(
+            db, run.id, "failed", "Workflow failed while being scheduled.",
+            details={"error": run.error}, created_at=now,
+        )
         db.commit()
         raise HTTPException(
             status_code=503,
@@ -970,6 +1003,10 @@ def cancel_workflow_run(run_id: int, db: Session = Depends(get_db)):
         run.started_at = started_at
         run.finished_at = now
         run.duration_seconds = round(max(0.0, (now - started_at).total_seconds()), 3)
+        record_audit_event(
+            db, run.id, "cancelled", "Queued workflow cancelled before execution.",
+            created_at=now,
+        )
         db.commit()
         db.refresh(run)
         return {
@@ -980,6 +1017,10 @@ def cancel_workflow_run(run_id: int, db: Session = Depends(get_db)):
 
     if run.status == "running":
         run.cancel_requested = True
+        record_audit_event(
+            db, run.id, "cancellation_requested",
+            "Cancellation requested for running workflow.",
+        )
         db.commit()
         return {
             "run_id": run.id,
@@ -989,6 +1030,64 @@ def cancel_workflow_run(run_id: int, db: Session = Depends(get_db)):
         }
 
     raise HTTPException(status_code=409, detail=f"Workflow status '{run.status}' cannot be cancelled.")
+
+
+@app.get("/workflows/audit")
+def list_workflow_audit_events(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    run_id: int | None = Query(default=None, ge=1),
+    event_type: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """Return paginated workflow lifecycle audit history with optional filters."""
+    allowed_types = {
+        "created", "started", "completed", "failed", "cancelled",
+        "cancellation_requested",
+    }
+    if event_type is not None:
+        event_type = event_type.strip().lower()
+        if event_type not in allowed_types:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "Invalid event_type.", "allowed_event_types": sorted(allowed_types)},
+            )
+
+    query = db.query(WorkflowAuditEvent)
+    if run_id is not None:
+        query = query.filter(WorkflowAuditEvent.run_id == run_id)
+    if event_type:
+        query = query.filter(WorkflowAuditEvent.event_type == event_type)
+
+    total = query.count()
+    events = (
+        query.order_by(WorkflowAuditEvent.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+    return {
+        "items": [
+            {
+                "id": event.id,
+                "run_id": event.run_id,
+                "event_type": event.event_type,
+                "message": event.message,
+                "details": event.details or {},
+                "created_at": event.created_at,
+            }
+            for event in events
+        ],
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total_items": total,
+            "total_pages": (total + per_page - 1) // per_page,
+            "has_next": page * per_page < total,
+            "has_previous": page > 1 and total > 0,
+        },
+        "filters": {"run_id": run_id, "event_type": event_type},
+    }
 
 
 @app.get("/workflows/runs/{run_id}/traces")

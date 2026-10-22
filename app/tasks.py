@@ -8,6 +8,7 @@ from app.celery_app import celery_app
 from app.db import SessionLocal
 from app.logging_config import configure_logging
 from app.models import WorkflowRun, WorkflowStepTrace
+from app.audit import record_audit_event
 from app.tools import execute_tool
 
 from app.workflow_runtime import (
@@ -76,6 +77,10 @@ class ReliableWorkflowTask(Task):
                     "failed",
                     f"Background task failed: {type(exc).__name__}: {exc}",
                 )
+                record_audit_event(
+                    db, run.id, "failed", "Workflow failed in the background worker.",
+                    details={"error": f"{type(exc).__name__}: {exc}"},
+                )
                 db.commit()
                 logger.exception(
                     "Workflow %s failed in Celery task %s",
@@ -141,6 +146,10 @@ def execute_workflow_task(self, run_id: int, steps: list[dict]):
 
         run.status = "running"
         run.error = None
+        record_audit_event(
+            db, run.id, "started", "Workflow execution started by worker.",
+            details={"task_id": getattr(self.request, "id", None)},
+        )
         db.commit()
 
         logger.info(
@@ -170,6 +179,10 @@ def execute_workflow_task(self, run_id: int, steps: list[dict]):
             run.results = exc.partial_results
             run.total_steps = len(exc.partial_results)
             finish_run(run, "cancelled", str(exc))
+            record_audit_event(
+                db, run.id, "cancelled", "Workflow execution cancelled.",
+                details={"next_step_number": exc.next_step_number},
+            )
             db.commit()
             logger.info("Workflow %s cancelled before step %s", run_id, exc.next_step_number)
             return {
@@ -191,6 +204,11 @@ def execute_workflow_task(self, run_id: int, steps: list[dict]):
             else:
                 error_message = str(exc)
             finish_run(run, "failed", error_message)
+            record_audit_event(
+                db, run.id, "failed", "Workflow execution failed.",
+                details={"error": error_message, "total_steps": run.total_steps,
+                         "duration_seconds": run.duration_seconds},
+            )
             db.commit()
 
             logger.warning(
@@ -213,6 +231,10 @@ def execute_workflow_task(self, run_id: int, steps: list[dict]):
         run.results = results
         run.total_steps = len(results)
         finish_run(run, "completed")
+        record_audit_event(
+            db, run.id, "completed", "Workflow execution completed successfully.",
+            details={"total_steps": run.total_steps, "duration_seconds": run.duration_seconds},
+        )
         db.commit()
 
         logger.info(

@@ -55,3 +55,16 @@ class WorkflowTemplate(Base):
     steps = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+
+class WorkflowAuditEvent(Base):
+    """Append-only lifecycle event for a workflow run."""
+
+    __tablename__ = "workflow_audit_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(String(40), nullable=False, index=True)
+    message = Column(Text, nullable=False)
+    details = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
