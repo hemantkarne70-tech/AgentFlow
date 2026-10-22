@@ -120,6 +120,51 @@ async def api_key_and_rate_limit_middleware(request: Request, call_next):
     response.headers["X-RateLimit-Remaining"] = str(remaining)
     return response
 
+
+@app.middleware("http")
+async def request_id_and_access_log_middleware(request: Request, call_next):
+    """Attach a safe correlation ID and log each HTTP request's outcome."""
+    import re
+    import uuid
+
+    supplied_id = request.headers.get("X-Request-ID", "").strip()
+    if supplied_id and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", supplied_id):
+        request_id = supplied_id
+    else:
+        request_id = uuid.uuid4().hex
+
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        logger.exception(
+            "http_request_failed",
+            extra={
+                "request_id": request_id,
+                "http_method": request.method,
+                "http_path": request.url.path,
+                "http_status_code": status_code,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
+        )
+        raise
+    finally:
+        logger.info(
+            "http_request_completed",
+            extra={
+                "request_id": request_id,
+                "http_method": request.method,
+                "http_path": request.url.path,
+                "http_status_code": status_code,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
+        )
+
 Base.metadata.create_all(bind=engine)
 
 
