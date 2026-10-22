@@ -1,6 +1,8 @@
-"""Safe, deterministic step execution with references to earlier results."""
+"""Safe workflow execution with data passing and per-step tracing."""
 
 import json
+import time
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 
@@ -9,7 +11,7 @@ class WorkflowInputError(ValueError):
 
 
 class WorkflowStepExecutionError(RuntimeError):
-    """Execution failure that retains the successful results before the failure."""
+    """Execution failure that retains successful results and trace context."""
 
     def __init__(self, step_number: int, cause: Exception, partial_results: list[dict]):
         self.step_number = step_number
@@ -28,13 +30,23 @@ def _stringify(value: Any) -> str:
     return str(value)
 
 
-def resolve_step_input(step: dict, completed_results: list[dict], current_step: int) -> str:
-    """Resolve either a literal input or {step: N, field: 'result.x'} reference.
+def _preview(value: Any, limit: int = 2000) -> str | None:
+    """Create a bounded trace preview without changing the actual tool input/output."""
+    if value is None:
+        return None
+    try:
+        rendered = value if isinstance(value, str) else json.dumps(
+            value, ensure_ascii=False, sort_keys=True, default=str
+        )
+    except Exception:
+        rendered = str(value)
+    if len(rendered) > limit:
+        return rendered[:limit] + "...[truncated]"
+    return rendered
 
-    Step numbers are 1-based and must refer to an earlier successful step.
-    Field paths start at the result value, e.g. `result.words` is expressed as
-    `words` because the reference already selects the result field.
-    """
+
+def resolve_step_input(step: dict, completed_results: list[dict], current_step: int) -> str:
+    """Resolve a literal input or a reference to an earlier step's result."""
     reference = step.get("input_from")
     literal = step.get("input", "")
 
@@ -70,25 +82,65 @@ def resolve_step_input(step: dict, completed_results: list[dict], current_step: 
     resolved_value = _stringify(value)
     if not resolved_value.strip():
         raise WorkflowInputError(
-            f"Step {source_step} resolved to an empty input; "
-            "check the referenced result and field path."
+            f"Step {source_step} resolved to an empty input; check the referenced result and field path."
         )
     return resolved_value
 
 
 def execute_workflow_steps(
-    steps: list[dict], execute_tool: Callable[[str, str], Any]
+    steps: list[dict],
+    execute_tool: Callable[[str, str], Any],
+    trace_callback: Callable[[dict], None] | None = None,
 ) -> list[dict]:
-    """Execute steps in order and make successful results available downstream."""
+    """Execute steps in order, preserving result shape and emitting a trace per step."""
     results: list[dict] = []
+
     for index, step in enumerate(steps, start=1):
+        tool = step.get("tool")
+        started_at = datetime.now(timezone.utc)
+        monotonic_start = time.perf_counter()
+        resolved_input = None
+
         try:
-            tool = step.get("tool")
             if not isinstance(tool, str) or not tool:
                 raise WorkflowInputError("Each step must specify a tool.")
+
             resolved_input = resolve_step_input(step, results, index)
             result = execute_tool(tool, resolved_input)
+            finished_at = datetime.now(timezone.utc)
+            duration = round(max(0.0, time.perf_counter() - monotonic_start), 6)
             results.append({"step": index, "tool": tool, "result": result})
+
+            if trace_callback is not None:
+                trace_callback({
+                    "step_number": index,
+                    "tool": tool,
+                    "status": "completed",
+                    "input_preview": _preview(resolved_input),
+                    "output_preview": _preview(result),
+                    "error": None,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "duration_seconds": duration,
+                })
         except Exception as exc:
+            finished_at = datetime.now(timezone.utc)
+            duration = round(max(0.0, time.perf_counter() - monotonic_start), 6)
+            if trace_callback is not None:
+                trace_callback({
+                    "step_number": index,
+                    "tool": tool if isinstance(tool, str) else "unknown",
+                    "status": "failed",
+                    "input_preview": _preview(
+                        resolved_input if resolved_input is not None
+                        else step.get("input_from", step.get("input", ""))
+                    ),
+                    "output_preview": None,
+                    "error": f"{type(exc).__name__}: {exc}"[:4000],
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "duration_seconds": duration,
+                })
             raise WorkflowStepExecutionError(index, exc, results) from exc
+
     return results

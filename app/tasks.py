@@ -7,7 +7,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 from app.celery_app import celery_app
 from app.db import SessionLocal
 from app.logging_config import configure_logging
-from app.models import WorkflowRun
+from app.models import WorkflowRun, WorkflowStepTrace
 from app.tools import execute_tool
 
 from app.workflow_runtime import (
@@ -148,8 +148,15 @@ def execute_workflow_task(self, run_id: int, steps: list[dict]):
             getattr(self.request, "id", None),
         )
 
+        def persist_step_trace(trace: dict) -> None:
+            db.add(WorkflowStepTrace(run_id=run_id, **trace))
+            # Persist each step as it finishes so diagnostics survive later failures.
+            db.commit()
+
         try:
-            results = execute_workflow_steps(steps, execute_tool)
+            results = execute_workflow_steps(
+                steps, execute_tool, trace_callback=persist_step_trace
+            )
         except WorkflowStepExecutionError as exc:
             run.results = exc.partial_results
             run.total_steps = len(exc.partial_results)

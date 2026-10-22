@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from app.db import Base, SessionLocal, engine
-from app.models import WorkflowRun
+from app.models import WorkflowRun, WorkflowStepTrace
 from app.tasks import execute_workflow_task
 from app.ai_planner import (
     AIConfigurationError,
@@ -318,9 +318,12 @@ def execute_workflow(
     started_at = datetime.now(timezone.utc)
     steps = [step.model_dump(exclude_none=True) for step in workflow.steps]
     error_message = None
+    step_traces = []
 
     try:
-        results = execute_workflow_steps(steps, execute_tool)
+        results = execute_workflow_steps(
+            steps, execute_tool, trace_callback=step_traces.append
+        )
     except WorkflowStepExecutionError as exc:
         results = exc.partial_results
         error_message = str(exc)
@@ -343,6 +346,9 @@ def execute_workflow(
         duration_seconds=duration_seconds,
     )
     db.add(run)
+    db.flush()
+    for trace in step_traces:
+        db.add(WorkflowStepTrace(run_id=run.id, **trace))
     db.commit()
     db.refresh(run)
 
@@ -508,6 +514,41 @@ def list_workflow_runs(
     }
 
 
+@app.get("/workflows/runs/{run_id}/traces")
+def get_workflow_run_traces(
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    run = db.get(WorkflowRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+
+    traces = (
+        db.query(WorkflowStepTrace)
+        .filter(WorkflowStepTrace.run_id == run_id)
+        .order_by(WorkflowStepTrace.step_number.asc())
+        .all()
+    )
+    return {
+        "run_id": run_id,
+        "total_traces": len(traces),
+        "items": [
+            {
+                "step_number": trace.step_number,
+                "tool": trace.tool,
+                "status": trace.status,
+                "input_preview": trace.input_preview,
+                "output_preview": trace.output_preview,
+                "error": trace.error,
+                "started_at": trace.started_at,
+                "finished_at": trace.finished_at,
+                "duration_seconds": trace.duration_seconds,
+            }
+            for trace in traces
+        ],
+    }
+
+
 @app.get("/workflows/runs/{run_id}")
 def get_workflow_run(
     run_id: int,
@@ -521,12 +562,33 @@ def get_workflow_run(
             detail="Workflow run not found.",
         )
 
+    traces = (
+        db.query(WorkflowStepTrace)
+        .filter(WorkflowStepTrace.run_id == run.id)
+        .order_by(WorkflowStepTrace.step_number.asc())
+        .all()
+    )
+
     return {
         "run_id": run.id,
         "workflow": run.name,
         "status": run.status,
         "total_steps": run.total_steps,
         "results": run.results,
+        "step_traces": [
+            {
+                "step_number": trace.step_number,
+                "tool": trace.tool,
+                "status": trace.status,
+                "input_preview": trace.input_preview,
+                "output_preview": trace.output_preview,
+                "error": trace.error,
+                "started_at": trace.started_at,
+                "finished_at": trace.finished_at,
+                "duration_seconds": trace.duration_seconds,
+            }
+            for trace in traces
+        ],
         "error": run.error,
         "created_at": run.created_at,
         "started_at": run.started_at,

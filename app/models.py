@@ -1,8 +1,6 @@
-
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, Float, Integer, JSON, String, Text
-
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text
 from app.db import Base
 
 
@@ -19,11 +17,25 @@ class WorkflowRun(Base):
     total_steps = Column(Integer, nullable=False, default=0)
     results = Column(JSON, nullable=False, default=list)
     error = Column(Text, nullable=True)
-    created_at = Column(
-        DateTime(timezone=True),
-        nullable=False,
-        default=utc_now,
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
     duration_seconds = Column(Float, nullable=True)
+
+
+class WorkflowStepTrace(Base):
+    """Persisted execution diagnostics for an individual workflow step."""
+
+    __tablename__ = "workflow_step_traces"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("workflow_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    step_number = Column(Integer, nullable=False)
+    tool = Column(String(50), nullable=False)
+    status = Column(String(20), nullable=False, index=True)
+    input_preview = Column(Text, nullable=True)
+    output_preview = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=False)
+    duration_seconds = Column(Float, nullable=False, default=0.0)
