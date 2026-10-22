@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from app.db import Base, SessionLocal, engine
-from app.models import WorkflowRun, WorkflowStepTrace
+from app.models import WorkflowRun, WorkflowStepTrace, WorkflowTemplate
 from app.tasks import execute_workflow_task
 from app.ai_planner import (
     AIConfigurationError,
@@ -166,6 +166,42 @@ class WorkflowRequest(BaseModel):
                 raise ValueError("A step can reference only an earlier step.")
         return self
 
+
+
+class WorkflowTemplateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=1000)
+    steps: list[WorkflowStep] = Field(min_length=1, max_length=20)
+
+    @field_validator("name")
+    @classmethod
+    def template_name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Template name cannot be blank.")
+        return value.strip()
+
+    @field_validator("description")
+    @classmethod
+    def clean_description(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def validate_template_step_references(self):
+        for index, step in enumerate(self.steps, start=1):
+            if step.input_from and step.input_from.step >= index:
+                raise ValueError("A step can reference only an earlier step.")
+        return self
+
+
+def template_payload(template: WorkflowTemplate) -> dict:
+    return {
+        "id": template.id,
+        "name": template.name,
+        "description": template.description,
+        "steps": template.steps,
+        "created_at": template.created_at,
+        "updated_at": template.updated_at,
+    }
 
 def execute_tool(tool: str, value: str) -> Any:
     """Run one of the explicitly registered tools."""
@@ -595,3 +631,120 @@ def get_workflow_run(
         "finished_at": run.finished_at,
         "duration_seconds": run.duration_seconds,
     }
+
+
+# Workflow templates: reusable definitions that can be executed repeatedly.
+@app.post("/workflows/templates", status_code=201)
+def create_workflow_template(
+    template_request: WorkflowTemplateRequest,
+    db: Session = Depends(get_db),
+):
+    existing = db.query(WorkflowTemplate).filter(
+        WorkflowTemplate.name == template_request.name
+    ).first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="A template with this name already exists.")
+
+    template = WorkflowTemplate(
+        name=template_request.name,
+        description=template_request.description,
+        steps=[step.model_dump(exclude_none=True) for step in template_request.steps],
+    )
+    db.add(template)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Could not create workflow template")
+        raise HTTPException(status_code=500, detail="Could not save workflow template.")
+    db.refresh(template)
+    return template_payload(template)
+
+
+@app.get("/workflows/templates")
+def list_workflow_templates(
+    search: str | None = Query(default=None, max_length=100),
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=10, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    query = db.query(WorkflowTemplate)
+    if search and search.strip():
+        term = search.strip()
+        query = query.filter(WorkflowTemplate.name.ilike(f"%{term}%"))
+    total = query.count()
+    total_pages = (total + per_page - 1) // per_page
+    templates = (
+        query.order_by(WorkflowTemplate.updated_at.desc(), WorkflowTemplate.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+    return {
+        "items": [template_payload(item) for item in templates],
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total_items": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_previous": page > 1 and total > 0,
+        },
+    }
+
+
+@app.get("/workflows/templates/{template_id}")
+def get_workflow_template(template_id: int, db: Session = Depends(get_db)):
+    template = db.get(WorkflowTemplate, template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail="Workflow template not found.")
+    return template_payload(template)
+
+
+@app.put("/workflows/templates/{template_id}")
+def update_workflow_template(
+    template_id: int,
+    template_request: WorkflowTemplateRequest,
+    db: Session = Depends(get_db),
+):
+    template = db.get(WorkflowTemplate, template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail="Workflow template not found.")
+
+    duplicate = db.query(WorkflowTemplate).filter(
+        WorkflowTemplate.name == template_request.name,
+        WorkflowTemplate.id != template_id,
+    ).first()
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="A template with this name already exists.")
+
+    template.name = template_request.name
+    template.description = template_request.description
+    template.steps = [step.model_dump(exclude_none=True) for step in template_request.steps]
+    template.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(template)
+    return template_payload(template)
+
+
+@app.delete("/workflows/templates/{template_id}", status_code=204)
+def delete_workflow_template(template_id: int, db: Session = Depends(get_db)):
+    template = db.get(WorkflowTemplate, template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail="Workflow template not found.")
+    db.delete(template)
+    db.commit()
+    return None
+
+
+@app.post("/workflows/templates/{template_id}/execute", status_code=202)
+def execute_workflow_template(
+    template_id: int,
+    db: Session = Depends(get_db),
+):
+    template = db.get(WorkflowTemplate, template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail="Workflow template not found.")
+
+    workflow = WorkflowRequest(name=template.name, steps=template.steps)
+    return execute_workflow_async(workflow=workflow, db=db)

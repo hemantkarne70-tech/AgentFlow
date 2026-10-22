@@ -39,3 +39,16 @@ class WorkflowStepTrace(Base):
     started_at = Column(DateTime(timezone=True), nullable=False)
     finished_at = Column(DateTime(timezone=True), nullable=False)
     duration_seconds = Column(Float, nullable=False, default=0.0)
+
+
+class WorkflowTemplate(Base):
+    """Reusable, named workflow definition."""
+
+    __tablename__ = "workflow_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False, unique=True, index=True)
+    description = Column(Text, nullable=False, default="")
+    steps = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
