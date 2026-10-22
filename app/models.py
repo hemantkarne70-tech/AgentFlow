@@ -68,3 +68,21 @@ class WorkflowAuditEvent(Base):
     message = Column(Text, nullable=False)
     details = Column(JSON, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
+
+
+class WorkflowSchedule(Base):
+    """Persistent recurring workflow definition managed by the API and Celery Beat."""
+
+    __tablename__ = "workflow_schedules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False, index=True)
+    steps = Column(JSON, nullable=False)
+    recurrence = Column(String(20), nullable=False)
+    timezone = Column(String(100), nullable=False, default="UTC")
+    interval_minutes = Column(Integer, nullable=True)
+    next_run_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    last_run_at = Column(DateTime(timezone=True), nullable=True)
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)

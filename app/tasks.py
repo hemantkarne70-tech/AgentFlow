@@ -1,13 +1,15 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from celery import Task
+from sqlalchemy import and_, update
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 from app.celery_app import celery_app
 from app.db import SessionLocal
 from app.logging_config import configure_logging
-from app.models import WorkflowRun, WorkflowStepTrace
+from app.models import WorkflowRun, WorkflowStepTrace, WorkflowSchedule
 from app.audit import record_audit_event
 from app.tools import execute_tool
 
@@ -265,5 +267,122 @@ def execute_workflow_task(self, run_id: int, steps: list[dict]):
         db.rollback()
         logger.exception("Unhandled worker error for workflow %s", run_id)
         raise
+    finally:
+        db.close()
+
+
+def _next_schedule_occurrence(due_at, recurrence, timezone_name, interval_minutes):
+    """Calculate the next run in UTC, preserving local wall time for daily/weekly schedules."""
+    if due_at.tzinfo is None:
+        due_at = due_at.replace(tzinfo=timezone.utc)
+    else:
+        due_at = due_at.astimezone(timezone.utc)
+    if recurrence == "interval":
+        step = timedelta(minutes=interval_minutes or 1)
+        candidate = due_at + step
+        now = utc_now()
+        while candidate <= now:
+            candidate += step
+        return candidate
+
+    zone = ZoneInfo(timezone_name)
+    local_due = due_at.astimezone(zone)
+    delta = timedelta(days=1 if recurrence == "daily" else 7)
+    candidate = (local_due + delta).astimezone(timezone.utc)
+    now = utc_now()
+    # Skip missed occurrences after a long outage instead of creating a backlog.
+    while candidate <= now:
+        local_due = candidate.astimezone(zone)
+        candidate = (local_due + delta).astimezone(timezone.utc)
+    return candidate
+
+
+@celery_app.task(name="app.tasks.dispatch_due_workflow_schedules")
+def dispatch_due_workflow_schedules():
+    """Claim due recurring schedules and enqueue one workflow run per claimed occurrence.
+
+    Run by Celery Beat every 30 seconds. A conditional database update prevents
+    concurrent beat processes from claiming the same occurrence.
+    """
+    now = utc_now()
+    db = SessionLocal()
+    dispatched = 0
+    try:
+        due_schedules = (
+            db.query(WorkflowSchedule)
+            .filter(
+                WorkflowSchedule.enabled.is_(True),
+                WorkflowSchedule.next_run_at <= now,
+            )
+            .order_by(WorkflowSchedule.next_run_at.asc(), WorkflowSchedule.id.asc())
+            .limit(100)
+            .all()
+        )
+
+        for schedule in due_schedules:
+            due_at = schedule.next_run_at
+            if due_at.tzinfo is None:
+                due_at = due_at.replace(tzinfo=timezone.utc)
+            else:
+                due_at = due_at.astimezone(timezone.utc)
+            next_at = _next_schedule_occurrence(
+                due_at, schedule.recurrence, schedule.timezone, schedule.interval_minutes
+            )
+
+            # Compare-and-set claim: only one beat process can advance this due occurrence.
+            claim = db.execute(
+                update(WorkflowSchedule)
+                .where(
+                    WorkflowSchedule.id == schedule.id,
+                    WorkflowSchedule.enabled.is_(True),
+                    WorkflowSchedule.next_run_at == schedule.next_run_at,
+                )
+                .values(next_run_at=next_at, last_run_at=due_at)
+            )
+            if claim.rowcount != 1:
+                db.rollback()
+                continue
+            db.commit()
+
+            run = WorkflowRun(
+                name=schedule.name,
+                status="queued",
+                total_steps=0,
+                results=[],
+                error=None,
+                scheduled_for=due_at,
+            )
+            db.add(run)
+            db.flush()
+            record_audit_event(
+                db, run.id, "created", "Recurring workflow run created.",
+                details={"schedule_id": schedule.id, "scheduled_for": due_at.isoformat()},
+            )
+            db.commit()
+            db.refresh(run)
+
+            try:
+                task = execute_workflow_task.delay(run.id, schedule.steps)
+                run.celery_task_id = task.id
+                db.commit()
+                dispatched += 1
+            except Exception as exc:
+                db.rollback()
+                failed_run = db.get(WorkflowRun, run.id)
+                if failed_run is not None and failed_run.status == "queued":
+                    finished_at = utc_now()
+                    failed_run.status = "failed"
+                    failed_run.error = f"Could not enqueue scheduled workflow: {type(exc).__name__}: {exc}"
+                    failed_run.started_at = finished_at
+                    failed_run.finished_at = finished_at
+                    failed_run.duration_seconds = 0.0
+                    record_audit_event(
+                        db, failed_run.id, "failed", "Recurring workflow could not be queued.",
+                        details={"schedule_id": schedule.id, "error": failed_run.error},
+                        created_at=finished_at,
+                    )
+                    db.commit()
+                logger.exception("Could not enqueue scheduled workflow for schedule %s", schedule.id)
+        return {"dispatched": dispatched, "checked": len(due_schedules)}
     finally:
         db.close()

@@ -5,6 +5,7 @@ import math
 import operator
 from typing import Any, Literal
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import logging
 import hmac
 import os
@@ -24,7 +25,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, inspect, text
 
 from app.db import Base, SessionLocal, engine
-from app.models import WorkflowRun, WorkflowStepTrace, WorkflowTemplate, WorkflowAuditEvent
+from app.models import WorkflowRun, WorkflowStepTrace, WorkflowTemplate, WorkflowAuditEvent, WorkflowSchedule
 from app.audit import record_audit_event
 from app.tasks import execute_workflow_task
 from app.ai_planner import (
@@ -413,6 +414,40 @@ class ScheduledWorkflowRequest(WorkflowRequest):
         if scheduled_utc > now + timedelta(days=7):
             raise ValueError("scheduled_at cannot be more than 7 days in the future.")
         return scheduled_utc
+
+
+class RecurringWorkflowScheduleRequest(WorkflowRequest):
+    """Validated recurring workflow schedule definition."""
+    start_at: datetime
+    recurrence: Literal["interval", "daily", "weekly"]
+    timezone: str = Field(default="UTC", min_length=1, max_length=100)
+    interval_minutes: int | None = Field(default=None, ge=1, le=10080)
+
+    @field_validator("start_at")
+    @classmethod
+    def start_at_must_be_aware_and_future(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("start_at must include a timezone.")
+        if value.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            raise ValueError("start_at must be in the future.")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("timezone must be a valid IANA timezone, such as Asia/Kolkata.") from exc
+        return value
+
+    @model_validator(mode="after")
+    def validate_recurrence_options(self):
+        if self.recurrence == "interval" and self.interval_minutes is None:
+            raise ValueError("interval_minutes is required for interval recurrence.")
+        if self.recurrence != "interval" and self.interval_minutes is not None:
+            raise ValueError("interval_minutes is only valid for interval recurrence.")
+        return self
 
 
 class WorkflowTemplateRequest(BaseModel):
@@ -824,6 +859,151 @@ def schedule_workflow(
         "status_url": f"/workflows/runs/{run.id}",
         "message": "Workflow scheduled successfully.",
     }
+
+
+def _schedule_next_occurrence(
+    due_at: datetime,
+    recurrence: str,
+    timezone_name: str,
+    interval_minutes: int | None,
+) -> datetime:
+    """Compute the next recurrence, preserving local wall time for daily/weekly schedules."""
+    due_utc = due_at.replace(tzinfo=timezone.utc) if due_at.tzinfo is None else due_at.astimezone(timezone.utc)
+    if recurrence == "interval":
+        return due_utc + timedelta(minutes=interval_minutes or 1)
+
+    local_due = due_utc.astimezone(ZoneInfo(timezone_name))
+    delta = timedelta(days=1 if recurrence == "daily" else 7)
+    candidate = (local_due + delta).astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    # Skip missed occurrences rather than flooding the queue after downtime.
+    while candidate <= now:
+        local_due = candidate.astimezone(ZoneInfo(timezone_name))
+        candidate = (local_due + delta).astimezone(timezone.utc)
+    return candidate
+
+
+def _schedule_payload(schedule: WorkflowSchedule) -> dict:
+    return {
+        "id": schedule.id,
+        "name": schedule.name,
+        "steps": schedule.steps,
+        "recurrence": schedule.recurrence,
+        "timezone": schedule.timezone,
+        "interval_minutes": schedule.interval_minutes,
+        "next_run_at": schedule.next_run_at,
+        "last_run_at": schedule.last_run_at,
+        "enabled": schedule.enabled,
+        "created_at": schedule.created_at,
+        "updated_at": schedule.updated_at,
+    }
+
+
+@app.post("/workflows/schedules", status_code=201)
+def create_recurring_workflow_schedule(
+    request: RecurringWorkflowScheduleRequest,
+    db: Session = Depends(get_db),
+):
+    schedule = WorkflowSchedule(
+        name=request.name,
+        steps=[step.model_dump(exclude_none=True) for step in request.steps],
+        recurrence=request.recurrence,
+        timezone=request.timezone,
+        interval_minutes=request.interval_minutes,
+        next_run_at=request.start_at,
+        enabled=True,
+    )
+    db.add(schedule)
+    db.commit()
+    db.refresh(schedule)
+    return _schedule_payload(schedule)
+
+
+@app.get("/workflows/schedules")
+def list_recurring_workflow_schedules(
+    enabled: bool | None = None,
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    query = db.query(WorkflowSchedule)
+    if enabled is not None:
+        query = query.filter(WorkflowSchedule.enabled == enabled)
+    total = query.count()
+    schedules = (
+        query.order_by(WorkflowSchedule.next_run_at.asc(), WorkflowSchedule.id.asc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+    return {
+        "items": [_schedule_payload(item) for item in schedules],
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total_items": total,
+            "total_pages": (total + per_page - 1) // per_page,
+        },
+    }
+
+
+@app.get("/workflows/schedules/{schedule_id}")
+def get_recurring_workflow_schedule(
+    schedule_id: int,
+    db: Session = Depends(get_db),
+):
+    schedule = db.get(WorkflowSchedule, schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="Workflow schedule not found.")
+    return _schedule_payload(schedule)
+
+
+@app.post("/workflows/schedules/{schedule_id}/pause")
+def pause_recurring_workflow_schedule(
+    schedule_id: int,
+    db: Session = Depends(get_db),
+):
+    schedule = db.get(WorkflowSchedule, schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="Workflow schedule not found.")
+    schedule.enabled = False
+    db.commit()
+    db.refresh(schedule)
+    return _schedule_payload(schedule)
+
+
+@app.post("/workflows/schedules/{schedule_id}/resume")
+def resume_recurring_workflow_schedule(
+    schedule_id: int,
+    db: Session = Depends(get_db),
+):
+    schedule = db.get(WorkflowSchedule, schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="Workflow schedule not found.")
+    if schedule.next_run_at is None or schedule.next_run_at <= datetime.now(timezone.utc):
+        schedule.next_run_at = _schedule_next_occurrence(
+            schedule.next_run_at or datetime.now(timezone.utc),
+            schedule.recurrence,
+            schedule.timezone,
+            schedule.interval_minutes,
+        )
+    schedule.enabled = True
+    db.commit()
+    db.refresh(schedule)
+    return _schedule_payload(schedule)
+
+
+@app.delete("/workflows/schedules/{schedule_id}", status_code=204)
+def delete_recurring_workflow_schedule(
+    schedule_id: int,
+    db: Session = Depends(get_db),
+):
+    schedule = db.get(WorkflowSchedule, schedule_id)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="Workflow schedule not found.")
+    db.delete(schedule)
+    db.commit()
+    return Response(status_code=204)
 
 
 @app.get("/workflows/runs")

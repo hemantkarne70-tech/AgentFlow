@@ -48,6 +48,23 @@ services:
       api:
         condition: service_healthy
     networks: [agentflow]
+  beat:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "celery", "-A", "app.celery_app:celery_app", "beat", "--loglevel=info"]
+    env_file: [.env]
+    environment:
+      APP_ENV: production
+      DEBUG: "false"
+      DATABASE_URL: sqlite:////data/agentflow.db
+      REDIS_URL: redis://redis:6379/0
+    volumes: [agentflow_data:/data]
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    networks: [agentflow]
 volumes:
   agentflow_data:
   redis_data:

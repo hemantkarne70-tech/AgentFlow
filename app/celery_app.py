@@ -18,4 +18,10 @@ celery_app.conf.update(
     task_track_started=True,
     task_ignore_result=True,
     broker_connection_retry_on_startup=True,
+    beat_schedule={
+        "dispatch-due-workflow-schedules-every-30-seconds": {
+            "task": "app.tasks.dispatch_due_workflow_schedules",
+            "schedule": 30.0,
+        },
+    },
 )
